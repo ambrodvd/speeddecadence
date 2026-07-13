@@ -1,13 +1,11 @@
 import streamlit as st
 import matplotlib.pyplot as plt
-import io
 import numpy as np
 import pandas as pd
-import streamlit as st
 from fitparse import FitFile
-import xml.etree.ElementTree as ET
 
-MIN_FILE_DURATION_S = 10 * 60  # file sotto questa durata esclusi dal riepilogo finale
+MIN_FILE_DURATION_S = 10 * 60  # file sotto questa durata esclusi dall'analisi
+N_BINS = 50  # 50 fette del 2% = 100% dell'EFD totale del file
 
 # ---------------------------------------------------------------------------
 # Energy cost of running as a function of slope (Minetti et al. 2002)
@@ -42,10 +40,10 @@ def seconds_to_hhmm(seconds) -> str:
 
 
 # ---------------------------------------------------------------------------
-# .fit parsing
+# .fit parsing (lat/lon/elevation/tempo — nessun dato cardiaco necessario qui)
 # ---------------------------------------------------------------------------
 def parse_fit(file_obj) -> pd.DataFrame:
-    """Extract lat, lon, elevation, heart rate, elapsed time (s) per record."""
+    """Extract lat, lon, elevation, elapsed time (s) per record."""
     fitfile = FitFile(file_obj)
     rows = []
     for record in fitfile.get_messages("record"):
@@ -59,19 +57,17 @@ def parse_fit(file_obj) -> pd.DataFrame:
         lat = lat_raw * SEMICIRCLE_TO_DEG
         lon = lon_raw * SEMICIRCLE_TO_DEG
         ele = data.get("enhanced_altitude", data.get("altitude"))
-        hr = data.get("heart_rate")
         ts = data.get("timestamp")
 
-        rows.append((lat, lon, ele, hr, ts))
+        rows.append((lat, lon, ele, ts))
 
-    df = pd.DataFrame(rows, columns=["lat", "lon", "ele", "hr", "timestamp"])
+    df = pd.DataFrame(rows, columns=["lat", "lon", "ele", "timestamp"])
     df = df.dropna(subset=["lat", "lon", "timestamp"]).reset_index(drop=True)
 
     if df.empty:
         return df
 
     df["ele"] = df["ele"].astype(float).ffill().bfill().fillna(0.0)
-    df["hr"] = df["hr"].astype(float)  # may contain NaN, handled later
     df["elapsed_s"] = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds()
     return df
 
@@ -86,29 +82,12 @@ def haversine_vec(lat1, lon1, lat2, lon2):
     return 2 * R * np.arcsin(np.sqrt(a))
 
 
-def hr_to_zone(hr, z1, z2, z3, z4, z5):
-    if np.isnan(hr):
-        return None
-    if hr <= z1:
-        return "Z1"
-    elif hr <= z2:
-        return "Z2"
-    elif hr <= z3:
-        return "Z3"
-    elif hr <= z4:
-        return "Z4"
-    else:
-        return "Z5"
-
-
 # ---------------------------------------------------------------------------
-# Core pipeline: smooth -> resample onto uniform distance grid -> cost -> EFS/zone
+# Core pipeline: smooth -> resample onto uniform distance grid -> cost -> EFD/EFS
 # ---------------------------------------------------------------------------
-def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float,
-                   zones: tuple):
+def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float):
     lat, lon, ele = df["lat"].to_numpy(), df["lon"].to_numpy(), df["ele"].to_numpy()
     time_s = df["elapsed_s"].to_numpy()
-    hr_raw = df["hr"].to_numpy()
 
     # Smooth elevation (rolling mean)
     ele_smooth = (pd.Series(ele)
@@ -130,10 +109,6 @@ def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float,
     ele_grid = np.interp(grid, cum_dist, ele_smooth)
     time_grid = np.interp(grid, cum_dist, time_s)
 
-    # HR: interpolate ignoring NaNs (fill gaps first so np.interp has valid data)
-    hr_series = pd.Series(hr_raw).interpolate(limit_direction="both").to_numpy()
-    hr_grid = np.interp(grid, cum_dist, hr_series)
-
     dx = np.diff(grid)
     dz = np.diff(ele_grid)
     dt = np.diff(time_grid)
@@ -144,9 +119,6 @@ def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float,
     energy = cost * dist3d                 # J/kg per segment
     efd_m = energy / FLAT_COST             # equivalent flat meters per segment
     efs_ms = np.divide(efd_m, dt, out=np.full_like(efd_m, np.nan), where=dt > 0)
-
-    hr_seg = (hr_grid[:-1] + hr_grid[1:]) / 2.0   # avg HR across the segment
-    zone = np.array([hr_to_zone(h, *zones) for h in hr_seg])
 
     d_plus = float(dz[dz > 0].sum())
     d_minus = float(-dz[dz < 0].sum())
@@ -161,8 +133,6 @@ def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float,
         "dt_s": dt,
         "efd_m": efd_m,
         "efs_ms": efs_ms,
-        "hr_avg": hr_seg,
-        "zone": zone,
     })
 
     summary = {
@@ -176,28 +146,88 @@ def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float,
     return segments, summary
 
 
-def zone_efs_table(segments: pd.DataFrame) -> pd.DataFrame:
-    """Average EFS per HR zone = total EFD in zone / total time in zone (time-weighted)."""
-    valid = segments.dropna(subset=["zone"])
-    rows = []
-    for z in ["Z1", "Z2", "Z3", "Z4", "Z5"]:
-        zdf = valid[valid["zone"] == z]
-        if zdf.empty:
-            continue
-        total_efd = zdf["efd_m"].sum()
-        total_time = zdf["dt_s"].sum()
-        if total_time <= 0:
-            continue
-        efs_ms = total_efd / total_time
-        rows.append({
-            "Zona": z,
-            "Tempo (min)": total_time / 60,
-            "EFD (km)": total_efd / 1000,
-            "EFS media (km/h)": efs_ms * 3.6,
-        })
-    return pd.DataFrame(rows)
+# ---------------------------------------------------------------------------
+# Model fitting: try several candidate shapes, pick the best by adjusted R²
+# ---------------------------------------------------------------------------
+def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
+    """
+    Fit several candidate forms of deviation_pct(x) where x = EFD progress (%).
+    Returns dict of name -> {coefs, predict_fn, label_fn, r2, adj_r2, k}
+    k = number of fitted parameters (used for adjusted R²).
+    """
+    n = len(x)
+    ss_tot = np.sum((y - y.mean()) ** 2)
 
-# --- File upload & processing settings ---
+    def r2_of(pred):
+        ss_res = np.sum((y - pred) ** 2)
+        return 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    def adj_r2_of(r2, k):
+        if n - k - 1 <= 0 or np.isnan(r2):
+            return np.nan
+        return 1 - (1 - r2) * (n - 1) / (n - k - 1)
+
+    candidates = {}
+
+    # Linear: y = a + b*x
+    c = np.polyfit(x, y, 1)
+    pred = np.polyval(c, x)
+    r2 = r2_of(pred)
+    candidates["Lineare"] = {
+        "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
+        "predict": lambda xx, c=c: np.polyval(c, xx),
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot p",
+    }
+
+    # Quadratic: y = a + b*x + c*x^2
+    c = np.polyfit(x, y, 2)
+    pred = np.polyval(c, x)
+    r2 = r2_of(pred)
+    candidates["Quadratica"] = {
+        "coefs": c, "k": 3, "r2": r2, "adj_r2": adj_r2_of(r2, 3),
+        "predict": lambda xx, c=c: np.polyval(c, xx),
+        "equation": rf"\Delta EFS(\%) = {c[2]:.3f} + {c[1]:.4f} \cdot p + {c[0]:.5f} \cdot p^2",
+    }
+
+    # Cubic: y = a + b*x + c*x^2 + d*x^3
+    c = np.polyfit(x, y, 3)
+    pred = np.polyval(c, x)
+    r2 = r2_of(pred)
+    candidates["Cubica"] = {
+        "coefs": c, "k": 4, "r2": r2, "adj_r2": adj_r2_of(r2, 4),
+        "predict": lambda xx, c=c: np.polyval(c, xx),
+        "equation": (rf"\Delta EFS(\%) = {c[3]:.3f} + {c[2]:.4f} \cdot p + "
+                     rf"{c[1]:.5f} \cdot p^2 + {c[0]:.6f} \cdot p^3"),
+    }
+
+    # Logaritmica: y = a + b*ln(x+1)
+    x_log = np.log1p(x)
+    c = np.polyfit(x_log, y, 1)
+    pred = np.polyval(c, x_log)
+    r2 = r2_of(pred)
+    candidates["Logaritmica"] = {
+        "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
+        "predict": lambda xx, c=c: np.polyval(c, np.log1p(xx)),
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \ln(p+1)",
+    }
+
+    # Radice quadrata: y = a + b*sqrt(x)
+    x_sqrt = np.sqrt(x)
+    c = np.polyfit(x_sqrt, y, 1)
+    pred = np.polyval(c, x_sqrt)
+    r2 = r2_of(pred)
+    candidates["Radice quadrata"] = {
+        "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
+        "predict": lambda xx, c=c: np.polyval(c, np.sqrt(xx)),
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \sqrt{{p}}",
+    }
+
+    return candidates
+
+
+# ===========================================================
+# Sidebar — upload & impostazioni
+# ===========================================================
 with st.sidebar:
     st.header("Impostazioni")
     uploaded_files = st.file_uploader(
@@ -210,86 +240,68 @@ with st.sidebar:
         "Il passo di ricampionamento controlla la risoluzione orizzontale usata per integrare l'energia."
     )
 
-per_file_zone_tables = []  # list of (filename, zone_table, total_time_s)
-per_file_segments = {}     # filename -> segments dataframe (needed for Lap Analysis below)
-
-for uploaded in uploaded_files:
-    st.header(f"📄 {uploaded.name}")
-
-    df_points = parse_fit(io.BytesIO(uploaded.getvalue()))
-    if len(df_points) < 2:
-        st.error("Traccia non valida: mancano punti GPS/timestamp validi in questo file.")
-        continue
-    if df_points["hr"].isna().all():
-        st.warning("⚠️ Nessun dato di frequenza cardiaca trovato in questo file: impossibile assegnare le zone.")
-        continue
-
-    segments, summary = process_track(df_points, smooth_window, resample_step, zones)
-    if segments is None:
-        st.error("Impossibile calcolare la distanza percorsa (traccia degenere).")
-        continue
-
-    per_file_segments[uploaded.name] = segments
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Distanza orizzontale", f"{summary['horizontal_distance_m']/1000:.2f} km")
-    c2.metric("D+ / D−", f"{summary['d_plus_m']:.0f} m / {summary['d_minus_m']:.0f} m")
-    c3.metric("EFD totale", f"{summary['efd_m']/1000:.2f} km")
-
-    st.subheader("EFS media per zona cardiaca")
-    zone_table = zone_efs_table(segments)
-    if zone_table.empty:
-        st.warning("Nessun segmento assegnabile a una zona (dati FC insufficienti).")
-    else:
-        display_table = zone_table.copy()
-        display_table["Tempo (min)"] = display_table["Tempo (min)"].round(0).astype(int)
-        st.dataframe(
-            display_table.style.format({
-                "EFD (km)": "{:.2f}",
-                "EFS media (km/h)": "{:.2f}",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.download_button(
-            label="📥 Scarica tabella zone (CSV)",
-            data=zone_table.to_csv(index=False).encode('utf-8'),
-            file_name=f"{uploaded.name.rsplit('.', 1)[0]}_zone_efs.csv",
-            mime='text/csv',
-            key=f"dl_{uploaded.name}",
-        )
-        per_file_zone_tables.append((uploaded.name, zone_table, summary["total_time_s"]))
-
-    with st.expander("Dettaglio segmenti (debug)"):
-        st.dataframe(segments, use_container_width=True)
-
-    st.divider()
-st.title("🎈 My new app")
-st.write(
-    "Let's start building! For help and inspiration, head over to [docs.streamlit.io](https://docs.streamlit.io/)."
-)
+st.title("SPEED DECADENCE")
+st.caption("EFD/EFS secondo il modello del costo energetico di Minetti et al. (2002).")
 
 # ===========================================================
-# UI — Decadimento EFS nel tempo
+# Elaborazione file caricati
+# ===========================================================
+per_file_segments = {}   # filename -> segments dataframe
+per_file_summary = {}    # filename -> summary dict
+
+if uploaded_files:
+    summary_rows = []
+    for f in uploaded_files:
+        raw = parse_fit(f)
+        if raw.empty or len(raw) < 2:
+            st.warning(f"⚠️ {f.name}: nessun dato GPS valido, file escluso.")
+            continue
+
+        segments, summary = process_track(raw, smooth_window, resample_step)
+        if segments is None:
+            st.warning(f"⚠️ {f.name}: distanza totale nulla, file escluso.")
+            continue
+
+        per_file_segments[f.name] = segments
+        per_file_summary[f.name] = summary
+
+        avg_efs_ms = summary["efd_m"] / summary["total_time_s"] if summary["total_time_s"] > 0 else np.nan
+        summary_rows.append({
+            "File": f.name,
+            "Durata": seconds_to_hhmm(summary["total_time_s"]),
+            "Distanza (km)": summary["horizontal_distance_m"] / 1000,
+            "D+ (m)": summary["d_plus_m"],
+            "D- (m)": summary["d_minus_m"],
+            "EFD (km)": summary["efd_m"] / 1000,
+            "EFS media (km/h)": avg_efs_ms * 3.6,
+        })
+
+    if summary_rows:
+        st.subheader("Riepilogo file")
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+else:
+    st.info("Carica uno o più file .fit dalla sidebar per iniziare.")
+
+# ===========================================================
+# Decadimento EFS in funzione dell'EFD accumulato
 # ===========================================================
 st.divider()
-st.header("📉 Decadimento EFS nel tempo")
+st.header("📉 Decadimento EFS in funzione dell'EFD accumulato")
 st.caption(
-    "Analizza come l'EFS varia lungo il tempo trascorso di ciascun allenamento: "
-    "ogni file viene tagliato in fette del 2% del tempo totale (50 fette), e per "
-    "ciascuna fetta si calcola lo scostamento percentuale dell'EFS di fetta rispetto "
-    "all'EFS medio dell'intero file. I dati di tutti i file vengono poi combinati per "
-    "stimare un'equazione generale del decadimento, applicabile ad altre gare/allenamenti."
+    "Per ciascun file viene calcolato l'EFD progressivo. Il file viene poi tagliato in "
+    "fette del 2% dell'EFD totale (50 fette): per ciascuna fetta si calcola lo scostamento "
+    "percentuale dell'EFS di fetta rispetto all'EFS medio dell'intero file, in funzione "
+    "della percentuale di EFD già accumulata (non del tempo trascorso). I dati di tutti i "
+    "file vengono combinati per stimare l'equazione che meglio descrive il decadimento, "
+    "utilizzabile per altre gare/allenamenti."
 )
-
-N_BINS = 50  # 50 fette del 2% = 100% del tempo totale
 
 decadence_rows = []
 
 for fname, seg in per_file_segments.items():
     total_time_s = float(seg["dt_s"].sum())
     if total_time_s < MIN_FILE_DURATION_S:
-        continue  # stesso filtro usato per il riepilogo finale (>= 10 minuti)
+        continue  # file troppo corto, escluso dall'analisi del decadimento
 
     total_efd_m = float(seg["efd_m"].sum())
     if total_time_s <= 0 or total_efd_m <= 0:
@@ -300,9 +312,10 @@ for fname, seg in per_file_segments.items():
     dt_arr = seg["dt_s"].to_numpy()
     efd_arr = seg["efd_m"].to_numpy()
 
-    cum_time_s = np.cumsum(dt_arr)
-    mid_time_s = cum_time_s - dt_arr / 2.0  # punto medio temporale di ogni segmento
-    progress_pct = np.clip(mid_time_s / total_time_s * 100.0, 0.0, 100.0 - 1e-9)
+    # Progresso in % dell'EFD accumulato (punto medio di ogni segmento)
+    cum_efd_before = np.cumsum(efd_arr) - efd_arr
+    mid_efd = cum_efd_before + efd_arr / 2.0
+    progress_pct = np.clip(mid_efd / total_efd_m * 100.0, 0.0, 100.0 - 1e-9)
     bin_idx = np.clip((progress_pct // 2).astype(int), 0, N_BINS - 1)
 
     for b in range(N_BINS):
@@ -333,60 +346,48 @@ else:
     x = decadence_df["progress_pct"].to_numpy()
     y = decadence_df["deviation_pct"].to_numpy()
 
-    # --- Fit lineare: y = b*x + a ---
-    lin_coefs = np.polyfit(x, y, deg=1)
-    lin_pred = np.polyval(lin_coefs, x)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    ss_res_lin = np.sum((y - lin_pred) ** 2)
-    r2_lin = 1 - ss_res_lin / ss_tot if ss_tot > 0 else np.nan
+    candidates = fit_candidates(x, y)
+    best_name = max(candidates, key=lambda k: (candidates[k]["adj_r2"]
+                                                if not np.isnan(candidates[k]["adj_r2"]) else -np.inf))
 
-    # --- Fit polinomiale grado 2: y = a2*x^2 + b2*x + c ---
-    quad_coefs = np.polyfit(x, y, deg=2)
-    quad_pred = np.polyval(quad_coefs, x)
-    ss_res_quad = np.sum((y - quad_pred) ** 2)
-    r2_quad = 1 - ss_res_quad / ss_tot if ss_tot > 0 else np.nan
-
-    st.subheader("Equazioni stimate")
-    col_lin, col_quad = st.columns(2)
-
-    with col_lin:
-        b_lin, a_lin = lin_coefs[0], lin_coefs[1]
-        st.markdown("**Lineare**")
-        st.latex(rf"\Delta EFS(\%) = {a_lin:.3f} + {b_lin:.4f} \cdot progresso(\%)")
-        st.caption(f"R² = {r2_lin:.3f}")
-
-    with col_quad:
-        a2_quad, b2_quad, c_quad = quad_coefs[0], quad_coefs[1], quad_coefs[2]
-        st.markdown("**Polinomiale (grado 2)**")
-        st.latex(
-            rf"\Delta EFS(\%) = {c_quad:.3f} + {b2_quad:.4f} \cdot progresso(\%) "
-            rf"+ {a2_quad:.5f} \cdot progresso(\%)^2"
-        )
-        st.caption(f"R² = {r2_quad:.3f}")
-
+    st.subheader("Equazioni candidate (ordinate per adj. R²)")
     st.caption(
-        "ΔEFS(%) = scostamento percentuale dell'EFS della fetta rispetto alla media "
-        "dell'intero file · progresso(%) = percentuale del tempo totale trascorso (0-100)."
+        "L'adjusted R² penalizza i modelli con più parametri, così un grado più alto vince "
+        "solo se spiega davvero più varianza, non solo perché ha più gradi di libertà."
     )
 
-    # --- Grafico: curva di ogni file (sottile) + i due fit combinati ---
+    ranked = sorted(candidates.items(), key=lambda kv: (kv[1]["adj_r2"]
+                                                          if not np.isnan(kv[1]["adj_r2"]) else -np.inf),
+                     reverse=True)
+
+    for name, c in ranked:
+        star = " 🏆 **migliore**" if name == best_name else ""
+        st.markdown(f"**{name}**{star}")
+        st.latex(c["equation"])
+        st.caption(f"R² = {c['r2']:.3f} · adj. R² = {c['adj_r2']:.3f}")
+
+    # --- Grafico: curva di ogni file (sottile) + il fit migliore in evidenza ---
     fig, ax = plt.subplots(figsize=(9, 5))
     for fname, fdf in decadence_df.groupby("file"):
         fdf_sorted = fdf.sort_values("progress_pct")
         ax.plot(fdf_sorted["progress_pct"], fdf_sorted["deviation_pct"],
-                alpha=0.35, linewidth=1)
+                alpha=0.3, linewidth=1)
 
     x_line = np.linspace(0, 100, 200)
-    ax.plot(x_line, np.polyval(lin_coefs, x_line),
-            color="tab:blue", linewidth=2.5, label="Fit lineare")
-    ax.plot(x_line, np.polyval(quad_coefs, x_line),
-            color="tab:red", linewidth=2.5, label="Fit polinomiale (grado 2)")
+    colors = {"Lineare": "tab:blue", "Quadratica": "tab:red", "Cubica": "tab:green",
+              "Logaritmica": "tab:orange", "Radice quadrata": "tab:purple"}
+    for name, c in candidates.items():
+        lw = 3 if name == best_name else 1.2
+        alpha = 1.0 if name == best_name else 0.5
+        label = f"{name}{' (migliore)' if name == best_name else ''}"
+        ax.plot(x_line, c["predict"](x_line), color=colors.get(name), linewidth=lw,
+                alpha=alpha, label=label)
     ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
 
-    ax.set_xlabel("Progresso nel tempo trascorso (%)")
+    ax.set_xlabel("Progresso EFD accumulato (%)")
     ax.set_ylabel("Scostamento EFS rispetto alla media del file (%)")
-    ax.set_title("Decadimento EFS lungo il tempo trascorso")
-    ax.legend()
+    ax.set_title("Decadimento EFS in funzione dell'EFD accumulato")
+    ax.legend(fontsize=8)
     st.pyplot(fig)
 
     with st.expander("Dati aggregati per fetta (debug/export)"):
