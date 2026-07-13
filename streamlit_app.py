@@ -5,7 +5,6 @@ import pandas as pd
 from fitparse import FitFile
 
 MIN_FILE_DURATION_S = 10 * 60  # file sotto questa durata esclusi dall'analisi
-N_BINS = 50  # 50 fette del 2% = 100% dell'EFD totale del file
 
 # ---------------------------------------------------------------------------
 # Energy cost of running as a function of slope (Minetti et al. 2002)
@@ -151,7 +150,9 @@ def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float):
 # ---------------------------------------------------------------------------
 def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
     """
-    Fit several candidate forms of deviation_pct(x) where x = EFD progress (%).
+    Fit several candidate forms of deviation_pct(x) where x = EFD accumulato (km),
+    valore assoluto e non percentuale, così il modello resta valido confrontando
+    file con EFD totali molto diversi tra loro.
     Returns dict of name -> {coefs, predict_fn, label_fn, r2, adj_r2, k}
     k = number of fitted parameters (used for adjusted R²).
     """
@@ -176,7 +177,7 @@ def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
     candidates["Lineare"] = {
         "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
         "predict": lambda xx, c=c: np.polyval(c, xx),
-        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot p",
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot e",
     }
 
     # Quadratic: y = a + b*x + c*x^2
@@ -186,7 +187,7 @@ def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
     candidates["Quadratica"] = {
         "coefs": c, "k": 3, "r2": r2, "adj_r2": adj_r2_of(r2, 3),
         "predict": lambda xx, c=c: np.polyval(c, xx),
-        "equation": rf"\Delta EFS(\%) = {c[2]:.3f} + {c[1]:.4f} \cdot p + {c[0]:.5f} \cdot p^2",
+        "equation": rf"\Delta EFS(\%) = {c[2]:.3f} + {c[1]:.4f} \cdot e + {c[0]:.5f} \cdot e^2",
     }
 
     # Cubic: y = a + b*x + c*x^2 + d*x^3
@@ -196,8 +197,8 @@ def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
     candidates["Cubica"] = {
         "coefs": c, "k": 4, "r2": r2, "adj_r2": adj_r2_of(r2, 4),
         "predict": lambda xx, c=c: np.polyval(c, xx),
-        "equation": (rf"\Delta EFS(\%) = {c[3]:.3f} + {c[2]:.4f} \cdot p + "
-                     rf"{c[1]:.5f} \cdot p^2 + {c[0]:.6f} \cdot p^3"),
+        "equation": (rf"\Delta EFS(\%) = {c[3]:.3f} + {c[2]:.4f} \cdot e + "
+                     rf"{c[1]:.5f} \cdot e^2 + {c[0]:.6f} \cdot e^3"),
     }
 
     # Logaritmica: y = a + b*ln(x+1)
@@ -208,7 +209,7 @@ def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
     candidates["Logaritmica"] = {
         "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
         "predict": lambda xx, c=c: np.polyval(c, np.log1p(xx)),
-        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \ln(p+1)",
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \ln(e+1)",
     }
 
     # Radice quadrata: y = a + b*sqrt(x)
@@ -219,7 +220,7 @@ def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
     candidates["Radice quadrata"] = {
         "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
         "predict": lambda xx, c=c: np.polyval(c, np.sqrt(xx)),
-        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \sqrt{{p}}",
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \sqrt{{e}}",
     }
 
     return candidates
@@ -238,6 +239,11 @@ with st.sidebar:
     st.caption(
         "Lo smoothing ripulisce la quota grezza GPS/barometrica prima di calcolare la pendenza. "
         "Il passo di ricampionamento controlla la risoluzione orizzontale usata per integrare l'energia."
+    )
+    bin_width_km = st.slider("Ampiezza fetta EFD (km)", 0.25, 5.0, 1.0, step=0.25)
+    st.caption(
+        "Il decadimento viene analizzato per fette di EFD assoluto (non percentuale), così file "
+        "con EFD totale molto diverso restano confrontabili sullo stesso asse."
     )
 
 st.title("SPEED DECADENCE")
@@ -288,12 +294,14 @@ else:
 st.divider()
 st.header("📉 Decadimento EFS in funzione dell'EFD accumulato")
 st.caption(
-    "Per ciascun file viene calcolato l'EFD progressivo. Il file viene poi tagliato in "
-    "fette del 2% dell'EFD totale (50 fette): per ciascuna fetta si calcola lo scostamento "
+    f"Per ciascun file viene calcolato l'EFD progressivo e tagliato in fette di "
+    f"{bin_width_km:g} km di EFD assoluto: per ciascuna fetta si calcola lo scostamento "
     "percentuale dell'EFS di fetta rispetto all'EFS medio dell'intero file, in funzione "
-    "della percentuale di EFD già accumulata (non del tempo trascorso). I dati di tutti i "
-    "file vengono combinati per stimare l'equazione che meglio descrive il decadimento, "
-    "utilizzabile per altre gare/allenamenti."
+    "dell'EFD già accumulato in km (non della percentuale del totale né del tempo trascorso). "
+    "In questo modo file con EFD totale molto diverso (es. 15 km vs 150 km) restano "
+    "confrontabili sullo stesso asse assoluto: un file corto contribuisce solo ai bin bassi, "
+    "uno lungo copre anche i bin alti. I dati di tutti i file vengono combinati per stimare "
+    "l'equazione che meglio descrive il decadimento, utilizzabile per altre gare/allenamenti."
 )
 
 decadence_rows = []
@@ -312,23 +320,24 @@ for fname, seg in per_file_segments.items():
     dt_arr = seg["dt_s"].to_numpy()
     efd_arr = seg["efd_m"].to_numpy()
 
-    # Progresso in % dell'EFD accumulato (punto medio di ogni segmento)
-    cum_efd_before = np.cumsum(efd_arr) - efd_arr
-    mid_efd = cum_efd_before + efd_arr / 2.0
-    progress_pct = np.clip(mid_efd / total_efd_m * 100.0, 0.0, 100.0 - 1e-9)
-    bin_idx = np.clip((progress_pct // 2).astype(int), 0, N_BINS - 1)
+    bin_width_m = bin_width_km * 1000.0
 
-    for b in range(N_BINS):
-        mask = bin_idx == b
-        bin_dt = dt_arr[mask].sum()
-        if bin_dt <= 0:
-            continue
-        bin_efd = efd_arr[mask].sum()
-        bin_efs_ms = bin_efd / bin_dt  # EFS della fetta, time-weighted
+    # EFD accumulato assoluto (punto medio di ogni segmento), in metri
+    cum_efd_before = np.cumsum(efd_arr) - efd_arr
+    mid_efd_m = cum_efd_before + efd_arr / 2.0
+    bin_idx = (mid_efd_m // bin_width_m).astype(int)
+
+    bin_df = pd.DataFrame({"bin_idx": bin_idx, "dt_s": dt_arr, "efd_m": efd_arr})
+    grouped = bin_df.groupby("bin_idx", as_index=False).sum()
+    grouped = grouped[grouped["dt_s"] > 0]
+
+    for _, row in grouped.iterrows():
+        bin_efs_ms = row["efd_m"] / row["dt_s"]  # EFS della fetta, time-weighted
         deviation_pct = (bin_efs_ms - avg_efs_ms) / avg_efs_ms * 100.0
+        efd_center_km = (row["bin_idx"] + 0.5) * bin_width_km
         decadence_rows.append({
             "file": fname,
-            "progress_pct": b * 2 + 1,   # centro della fetta: 1, 3, 5, ..., 99
+            "efd_accum_km": efd_center_km,
             "efs_kmh": bin_efs_ms * 3.6,
             "deviation_pct": deviation_pct,
         })
@@ -343,7 +352,7 @@ else:
     n_files_used = decadence_df["file"].nunique()
     st.caption(f"File inclusi nell'analisi: {n_files_used}")
 
-    x = decadence_df["progress_pct"].to_numpy()
+    x = decadence_df["efd_accum_km"].to_numpy()
     y = decadence_df["deviation_pct"].to_numpy()
 
     candidates = fit_candidates(x, y)
@@ -353,7 +362,8 @@ else:
     st.subheader("Equazioni candidate (ordinate per adj. R²)")
     st.caption(
         "L'adjusted R² penalizza i modelli con più parametri, così un grado più alto vince "
-        "solo se spiega davvero più varianza, non solo perché ha più gradi di libertà."
+        "solo se spiega davvero più varianza, non solo perché ha più gradi di libertà. "
+        "In tutte le equazioni, e = EFD accumulato in km (valore assoluto)."
     )
 
     ranked = sorted(candidates.items(), key=lambda kv: (kv[1]["adj_r2"]
@@ -369,11 +379,12 @@ else:
     # --- Grafico: curva di ogni file (sottile) + il fit migliore in evidenza ---
     fig, ax = plt.subplots(figsize=(9, 5))
     for fname, fdf in decadence_df.groupby("file"):
-        fdf_sorted = fdf.sort_values("progress_pct")
-        ax.plot(fdf_sorted["progress_pct"], fdf_sorted["deviation_pct"],
+        fdf_sorted = fdf.sort_values("efd_accum_km")
+        ax.plot(fdf_sorted["efd_accum_km"], fdf_sorted["deviation_pct"],
                 alpha=0.3, linewidth=1)
 
-    x_line = np.linspace(0, 100, 200)
+    x_max = decadence_df["efd_accum_km"].max()
+    x_line = np.linspace(0, x_max, 200)
     colors = {"Lineare": "tab:blue", "Quadratica": "tab:red", "Cubica": "tab:green",
               "Logaritmica": "tab:orange", "Radice quadrata": "tab:purple"}
     for name, c in candidates.items():
@@ -384,7 +395,7 @@ else:
                 alpha=alpha, label=label)
     ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
 
-    ax.set_xlabel("Progresso EFD accumulato (%)")
+    ax.set_xlabel("EFD accumulato (km)")
     ax.set_ylabel("Scostamento EFS rispetto alla media del file (%)")
     ax.set_title("Decadimento EFS in funzione dell'EFD accumulato")
     ax.legend(fontsize=8)
