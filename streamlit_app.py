@@ -258,12 +258,22 @@ per_file_summary = {}    # filename -> summary dict
 if uploaded_files:
     summary_rows = []
     for f in uploaded_files:
-        raw = parse_fit(f)
+        try:
+            raw = parse_fit(f)
+        except Exception as e:
+            st.warning(f"⚠️ {f.name}: file .fit illeggibile o corrotto, escluso ({e.__class__.__name__}).")
+            continue
+
         if raw.empty or len(raw) < 2:
             st.warning(f"⚠️ {f.name}: nessun dato GPS valido, file escluso.")
             continue
 
-        segments, summary = process_track(raw, smooth_window, resample_step)
+        try:
+            segments, summary = process_track(raw, smooth_window, resample_step)
+        except Exception as e:
+            st.warning(f"⚠️ {f.name}: errore durante l'elaborazione, escluso ({e.__class__.__name__}).")
+            continue
+
         if segments is None:
             st.warning(f"⚠️ {f.name}: distanza totale nulla, file escluso.")
             continue
