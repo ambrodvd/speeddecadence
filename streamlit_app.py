@@ -6,6 +6,10 @@ from fitparse import FitFile
 
 MIN_FILE_DURATION_S = 10 * 60  # file sotto questa durata esclusi dall'analisi
 
+# Soglie minime di file per abilitare modelli con più parametri (evita overfitting)
+MIN_FILES_FOR_QUADRATIC = 10
+MIN_FILES_FOR_CUBIC = 15
+
 # ---------------------------------------------------------------------------
 # Energy cost of running as a function of slope (Minetti et al. 2002)
 # ---------------------------------------------------------------------------
@@ -146,15 +150,70 @@ def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float):
 
 
 # ---------------------------------------------------------------------------
+# Bucket per lunghezza gara (EFD totale, km)
+# ---------------------------------------------------------------------------
+def get_bucket_definitions(t1: float, t2: float, t3: float):
+    """
+    Ritorna la lista ordinata dei nomi bucket e un dict nome -> (lo, hi) in km.
+    hi = None per il bucket aperto in alto.
+    """
+    order = [
+        f"< {t1:g} km",
+        f"{t1:g}-{t2:g} km",
+        f"{t2:g}-{t3:g} km",
+        f"> {t3:g} km",
+    ]
+    bounds = {
+        order[0]: (0.0, t1),
+        order[1]: (t1, t2),
+        order[2]: (t2, t3),
+        order[3]: (t3, None),
+    }
+    return order, bounds
+
+
+def assign_bucket(efd_totale_km: float, bucket_order, bucket_bounds) -> str:
+    for name in bucket_order:
+        lo, hi = bucket_bounds[name]
+        if hi is None:
+            if efd_totale_km >= lo:
+                return name
+        elif lo <= efd_totale_km < hi:
+            return name
+    return bucket_order[-1]
+
+
+def compute_bucket_centers(bucket_order, bucket_bounds, files_efd_km: dict):
+    """
+    Centro di ciascun bucket in km di EFD totale, usato per l'interpolazione.
+    Bucket chiusi: punto medio. Bucket aperto in alto: mediana dei file
+    realmente presenti in quel bucket (fallback: hi_precedente * 1.3).
+    """
+    centers = {}
+    for name in bucket_order:
+        lo, hi = bucket_bounds[name]
+        if hi is not None:
+            centers[name] = (lo + hi) / 2.0
+        else:
+            vals = [v for fname, (b, v) in files_efd_km.items() if b == name]
+            if vals:
+                centers[name] = float(np.median(vals))
+            else:
+                centers[name] = lo * 1.3
+    return centers
+
+
+# ---------------------------------------------------------------------------
 # Model fitting: try several candidate shapes, pick the best by adjusted R²
 # ---------------------------------------------------------------------------
-def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
+def fit_candidates(x: np.ndarray, y: np.ndarray, n_files: int) -> dict:
     """
-    Fit several candidate forms of deviation_pct(x) where x = EFD accumulato (km),
-    valore assoluto e non percentuale, così il modello resta valido confrontando
-    file con EFD totali molto diversi tra loro.
-    Returns dict of name -> {coefs, predict_fn, label_fn, r2, adj_r2, k}
-    k = number of fitted parameters (used for adjusted R²).
+    Fit several candidate forms of deviation_pct(x) where x = EFD% accumulata
+    nel file (0-100), relativa all'EFD totale del file stesso.
+
+    n_files = numero di file indipendenti a supporto (non righe/bin): usato
+    per limitare i gradi di libertà del modello quando il campione è piccolo,
+    dato che i bin di uno stesso file NON sono osservazioni indipendenti.
     """
     n = len(x)
     ss_tot = np.sum((y - y.mean()) ** 2)
@@ -170,38 +229,17 @@ def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
 
     candidates = {}
 
-    # Linear: y = a + b*x
+    # Linear: y = a + b*x  (k=2, sempre incluso)
     c = np.polyfit(x, y, 1)
     pred = np.polyval(c, x)
     r2 = r2_of(pred)
     candidates["Lineare"] = {
         "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
         "predict": lambda xx, c=c: np.polyval(c, xx),
-        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot e",
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot p",
     }
 
-    # Quadratic: y = a + b*x + c*x^2
-    c = np.polyfit(x, y, 2)
-    pred = np.polyval(c, x)
-    r2 = r2_of(pred)
-    candidates["Quadratica"] = {
-        "coefs": c, "k": 3, "r2": r2, "adj_r2": adj_r2_of(r2, 3),
-        "predict": lambda xx, c=c: np.polyval(c, xx),
-        "equation": rf"\Delta EFS(\%) = {c[2]:.3f} + {c[1]:.4f} \cdot e + {c[0]:.5f} \cdot e^2",
-    }
-
-    # Cubic: y = a + b*x + c*x^2 + d*x^3
-    c = np.polyfit(x, y, 3)
-    pred = np.polyval(c, x)
-    r2 = r2_of(pred)
-    candidates["Cubica"] = {
-        "coefs": c, "k": 4, "r2": r2, "adj_r2": adj_r2_of(r2, 4),
-        "predict": lambda xx, c=c: np.polyval(c, xx),
-        "equation": (rf"\Delta EFS(\%) = {c[3]:.3f} + {c[2]:.4f} \cdot e + "
-                     rf"{c[1]:.5f} \cdot e^2 + {c[0]:.6f} \cdot e^3"),
-    }
-
-    # Logaritmica: y = a + b*ln(x+1)
+    # Logaritmica: y = a + b*ln(x+1)  (k=2, sempre incluso)
     x_log = np.log1p(x)
     c = np.polyfit(x_log, y, 1)
     pred = np.polyval(c, x_log)
@@ -209,10 +247,10 @@ def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
     candidates["Logaritmica"] = {
         "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
         "predict": lambda xx, c=c: np.polyval(c, np.log1p(xx)),
-        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \ln(e+1)",
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \ln(p+1)",
     }
 
-    # Radice quadrata: y = a + b*sqrt(x)
+    # Radice quadrata: y = a + b*sqrt(x)  (k=2, sempre incluso)
     x_sqrt = np.sqrt(x)
     c = np.polyfit(x_sqrt, y, 1)
     pred = np.polyval(c, x_sqrt)
@@ -220,10 +258,73 @@ def fit_candidates(x: np.ndarray, y: np.ndarray) -> dict:
     candidates["Radice quadrata"] = {
         "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
         "predict": lambda xx, c=c: np.polyval(c, np.sqrt(xx)),
-        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \sqrt{{e}}",
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \sqrt{{p}}",
     }
 
+    # Quadratica: y = a + b*x + c*x^2  (k=3, richiede abbastanza file)
+    if n_files >= MIN_FILES_FOR_QUADRATIC:
+        c = np.polyfit(x, y, 2)
+        pred = np.polyval(c, x)
+        r2 = r2_of(pred)
+        candidates["Quadratica"] = {
+            "coefs": c, "k": 3, "r2": r2, "adj_r2": adj_r2_of(r2, 3),
+            "predict": lambda xx, c=c: np.polyval(c, xx),
+            "equation": rf"\Delta EFS(\%) = {c[2]:.3f} + {c[1]:.4f} \cdot p + {c[0]:.5f} \cdot p^2",
+        }
+
+    # Cubic: y = a + b*x + c*x^2 + d*x^3  (k=4, richiede ancora più file)
+    if n_files >= MIN_FILES_FOR_CUBIC:
+        c = np.polyfit(x, y, 3)
+        pred = np.polyval(c, x)
+        r2 = r2_of(pred)
+        candidates["Cubica"] = {
+            "coefs": c, "k": 4, "r2": r2, "adj_r2": adj_r2_of(r2, 4),
+            "predict": lambda xx, c=c: np.polyval(c, xx),
+            "equation": (rf"\Delta EFS(\%) = {c[3]:.3f} + {c[2]:.4f} \cdot p + "
+                         rf"{c[1]:.5f} \cdot p^2 + {c[0]:.6f} \cdot p^3"),
+        }
+
     return candidates
+
+
+def best_candidate(candidates: dict):
+    return max(candidates, key=lambda k: (candidates[k]["adj_r2"]
+                                           if not np.isnan(candidates[k]["adj_r2"]) else -np.inf))
+
+
+# ---------------------------------------------------------------------------
+# Predizione "sfumata": interpola tra le curve dei due bucket più vicini
+# per centro, cosi' non ci sono salti bruschi ai bordi dei bucket.
+# ---------------------------------------------------------------------------
+def predict_blended(efd_pct: float, efd_totale_gara_km: float,
+                     bucket_fits: dict, bucket_centers: dict, bucket_order: list) -> float:
+    """
+    bucket_fits: nome_bucket -> candidato migliore (dict con "predict")
+    bucket_centers: nome_bucket -> centro in km
+    Ritorna la deviazione % prevista, interpolando linearmente in base alla
+    distanza tra efd_totale_gara_km e i centri dei bucket disponibili.
+    """
+    available = [(name, bucket_centers[name]) for name in bucket_order if name in bucket_fits]
+    if not available:
+        return float("nan")
+    available.sort(key=lambda t: t[1])
+
+    if efd_totale_gara_km <= available[0][1]:
+        name = available[0][0]
+        return float(bucket_fits[name]["predict"](np.array([efd_pct]))[0])
+    if efd_totale_gara_km >= available[-1][1]:
+        name = available[-1][0]
+        return float(bucket_fits[name]["predict"](np.array([efd_pct]))[0])
+
+    for (name_lo, c_lo), (name_hi, c_hi) in zip(available[:-1], available[1:]):
+        if c_lo <= efd_totale_gara_km <= c_hi:
+            w_hi = (efd_totale_gara_km - c_lo) / (c_hi - c_lo)
+            w_lo = 1.0 - w_hi
+            pred_lo = bucket_fits[name_lo]["predict"](np.array([efd_pct]))[0]
+            pred_hi = bucket_fits[name_hi]["predict"](np.array([efd_pct]))[0]
+            return float(w_lo * pred_lo + w_hi * pred_hi)
+
+    return float("nan")
 
 
 # ===========================================================
@@ -240,20 +341,36 @@ with st.sidebar:
         "Lo smoothing ripulisce la quota grezza GPS/barometrica prima di calcolare la pendenza. "
         "Il passo di ricampionamento controlla la risoluzione orizzontale usata per integrare l'energia."
     )
-    bin_width_km = st.slider("Ampiezza fetta EFD (km)", 0.25, 5.0, 1.0, step=0.25)
+
+    st.divider()
+    st.subheader("Bucket per lunghezza gara (EFD totale)")
     st.caption(
-        "Il decadimento viene analizzato per fette di EFD assoluto (non percentuale), così file "
-        "con EFD totale molto diverso restano confrontabili sullo stesso asse."
+        "Ogni file viene assegnato a un bucket in base al suo EFD totale (km). "
+        "Il decadimento viene fittato separatamente per bucket, poi le curve vengono "
+        "interpolate in base alla lunghezza della gara target, per evitare salti bruschi ai bordi."
+    )
+    thr1 = st.number_input("Soglia 1 (km EFD)", min_value=1.0, value=40.0, step=5.0)
+    thr2 = st.number_input("Soglia 2 (km EFD)", min_value=thr1 + 1.0, value=max(60.0, thr1 + 1.0), step=5.0)
+    thr3 = st.number_input("Soglia 3 (km EFD)", min_value=thr2 + 1.0, value=max(100.0, thr2 + 1.0), step=5.0)
+
+    bin_width_pct = st.slider("Ampiezza fetta (% dell'EFD totale del file)", 1.0, 20.0, 5.0, step=1.0)
+    st.caption(
+        "Il decadimento viene analizzato per fette di EFD **relativo** (% del totale del file), "
+        "non assoluto: cosi' un file corto e uno lungo restano confrontabili sulla stessa posizione "
+        "relativa di gara. La lunghezza assoluta del file determina invece il bucket."
     )
 
 st.title("SPEED DECADENCE")
 st.caption("EFD/EFS secondo il modello del costo energetico di Minetti et al. (2002).")
+
+bucket_order, bucket_bounds = get_bucket_definitions(thr1, thr2, thr3)
 
 # ===========================================================
 # Elaborazione file caricati
 # ===========================================================
 per_file_segments = {}   # filename -> segments dataframe
 per_file_summary = {}    # filename -> summary dict
+per_file_bucket = {}     # filename -> (bucket_name, efd_totale_km)
 
 if uploaded_files:
     summary_rows = []
@@ -281,6 +398,10 @@ if uploaded_files:
         per_file_segments[f.name] = segments
         per_file_summary[f.name] = summary
 
+        efd_totale_km = summary["efd_m"] / 1000
+        bucket_name = assign_bucket(efd_totale_km, bucket_order, bucket_bounds)
+        per_file_bucket[f.name] = (bucket_name, efd_totale_km)
+
         avg_efs_ms = summary["efd_m"] / summary["total_time_s"] if summary["total_time_s"] > 0 else np.nan
         summary_rows.append({
             "File": f.name,
@@ -288,8 +409,9 @@ if uploaded_files:
             "Distanza (km)": summary["horizontal_distance_m"] / 1000,
             "D+ (m)": summary["d_plus_m"],
             "D- (m)": summary["d_minus_m"],
-            "EFD (km)": summary["efd_m"] / 1000,
+            "EFD (km)": efd_totale_km,
             "EFS media (km/h)": avg_efs_ms * 3.6,
+            "Bucket": bucket_name,
         })
 
     if summary_rows:
@@ -299,19 +421,51 @@ else:
     st.info("Carica uno o più file .fit dalla sidebar per iniziare.")
 
 # ===========================================================
-# Decadimento EFS in funzione dell'EFD accumulato
+# Pannello diagnostico: quanti file per bucket
+# ===========================================================
+if per_file_bucket:
+    st.divider()
+    st.subheader("📊 Distribuzione file per bucket")
+
+    diag_rows = []
+    for name in bucket_order:
+        files_in_bucket = [f for f, (b, _) in per_file_bucket.items() if b == name]
+        eligible = [
+            f for f in files_in_bucket
+            if per_file_segments[f]["dt_s"].sum() >= MIN_FILE_DURATION_S
+        ]
+        if len(eligible) == 0:
+            note = "❌ nessun file idoneo"
+        elif len(eligible) < MIN_FILES_FOR_QUADRATIC:
+            note = "⚠️ solo modelli lineari (pochi file)"
+        elif len(eligible) < MIN_FILES_FOR_CUBIC:
+            note = "🟡 fino a quadratica"
+        else:
+            note = "✅ tutti i modelli disponibili"
+        diag_rows.append({
+            "Bucket": name,
+            "File totali": len(files_in_bucket),
+            "File idonei (>=10 min)": len(eligible),
+            "Modelli disponibili": note,
+        })
+    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
+    st.caption(
+        f"Un bucket con meno di {MIN_FILES_FOR_QUADRATIC} file idonei usa solo modelli a 2 parametri "
+        f"(lineare/log/radice); servono almeno {MIN_FILES_FOR_CUBIC} file per la cubica. "
+        "Questo perché i bin di uno stesso file non sono osservazioni indipendenti: "
+        "il vero campione statistico è il numero di file, non il numero di righe aggregate."
+    )
+
+# ===========================================================
+# Decadimento EFS in funzione dell'EFD% accumulato, per bucket
 # ===========================================================
 st.divider()
-st.header("📉 Decadimento EFS in funzione dell'EFD accumulato")
+st.header("📉 Decadimento EFS per bucket di lunghezza gara")
 st.caption(
-    f"Per ciascun file viene calcolato l'EFD progressivo e tagliato in fette di "
-    f"{bin_width_km:g} km di EFD assoluto: per ciascuna fetta si calcola lo scostamento "
-    "percentuale dell'EFS di fetta rispetto all'EFS medio dell'intero file, in funzione "
-    "dell'EFD già accumulato in km (non della percentuale del totale né del tempo trascorso). "
-    "In questo modo file con EFD totale molto diverso (es. 15 km vs 150 km) restano "
-    "confrontabili sullo stesso asse assoluto: un file corto contribuisce solo ai bin bassi, "
-    "uno lungo copre anche i bin alti. I dati di tutti i file vengono combinati per stimare "
-    "l'equazione che meglio descrive il decadimento, utilizzabile per altre gare/allenamenti."
+    f"Per ciascun file viene calcolato l'EFD progressivo in **% del totale del file** e tagliato in fette "
+    f"di {bin_width_pct:g}%: per ciascuna fetta si calcola lo scostamento percentuale dell'EFS di fetta "
+    "rispetto all'EFS medio dell'intero file. I file vengono raggruppati per bucket di EFD totale "
+    "(lunghezza gara) e fittati separatamente, cosi' gare corte e lunghe non vengono mediate insieme."
 )
 
 decadence_rows = []
@@ -326,16 +480,16 @@ for fname, seg in per_file_segments.items():
         continue
 
     avg_efs_ms = total_efd_m / total_time_s  # EFS medio dell'intero file
+    bucket_name, efd_totale_km = per_file_bucket[fname]
 
     dt_arr = seg["dt_s"].to_numpy()
     efd_arr = seg["efd_m"].to_numpy()
 
-    bin_width_m = bin_width_km * 1000.0
-
-    # EFD accumulato assoluto (punto medio di ogni segmento), in metri
+    # EFD accumulato relativo (% del totale del file), punto medio di ogni segmento
     cum_efd_before = np.cumsum(efd_arr) - efd_arr
     mid_efd_m = cum_efd_before + efd_arr / 2.0
-    bin_idx = (mid_efd_m // bin_width_m).astype(int)
+    efd_pct_arr = mid_efd_m / total_efd_m * 100.0
+    bin_idx = (efd_pct_arr // bin_width_pct).astype(int)
 
     bin_df = pd.DataFrame({"bin_idx": bin_idx, "dt_s": dt_arr, "efd_m": efd_arr})
     grouped = bin_df.groupby("bin_idx", as_index=False).sum()
@@ -344,10 +498,12 @@ for fname, seg in per_file_segments.items():
     for _, row in grouped.iterrows():
         bin_efs_ms = row["efd_m"] / row["dt_s"]  # EFS della fetta, time-weighted
         deviation_pct = (bin_efs_ms - avg_efs_ms) / avg_efs_ms * 100.0
-        efd_center_km = (row["bin_idx"] + 0.5) * bin_width_km
+        efd_pct_center = (row["bin_idx"] + 0.5) * bin_width_pct
         decadence_rows.append({
             "file": fname,
-            "efd_accum_km": efd_center_km,
+            "bucket": bucket_name,
+            "efd_totale_km": efd_totale_km,
+            "efd_pct_accum": efd_pct_center,
             "efs_kmh": bin_efs_ms * 3.6,
             "deviation_pct": deviation_pct,
         })
@@ -359,55 +515,73 @@ if not decadence_rows:
     )
 else:
     decadence_df = pd.DataFrame(decadence_rows)
-    n_files_used = decadence_df["file"].nunique()
-    st.caption(f"File inclusi nell'analisi: {n_files_used}")
 
-    x = decadence_df["efd_accum_km"].to_numpy()
-    y = decadence_df["deviation_pct"].to_numpy()
+    bucket_fits = {}       # bucket_name -> miglior candidato
+    bucket_all_candidates = {}  # bucket_name -> tutti i candidati (per expander)
+    bucket_n_files = {}
 
-    candidates = fit_candidates(x, y)
-    best_name = max(candidates, key=lambda k: (candidates[k]["adj_r2"]
-                                                if not np.isnan(candidates[k]["adj_r2"]) else -np.inf))
+    for name in bucket_order:
+        bdf = decadence_df[decadence_df["bucket"] == name]
+        n_files = bdf["file"].nunique()
+        bucket_n_files[name] = n_files
+        if n_files == 0:
+            continue
+        x = bdf["efd_pct_accum"].to_numpy()
+        y = bdf["deviation_pct"].to_numpy()
+        candidates = fit_candidates(x, y, n_files)
+        if not candidates:
+            continue
+        bucket_all_candidates[name] = candidates
+        bucket_fits[name] = candidates[best_candidate(candidates)]
 
-    st.subheader("Equazioni candidate (ordinate per adj. R²)")
-    st.caption(
-        "L'adjusted R² penalizza i modelli con più parametri, così un grado più alto vince "
-        "solo se spiega davvero più varianza, non solo perché ha più gradi di libertà. "
-        "In tutte le equazioni, e = EFD accumulato in km (valore assoluto)."
-    )
+    files_efd_map = {f: per_file_bucket[f] for f in per_file_bucket}
+    bucket_centers = compute_bucket_centers(bucket_order, bucket_bounds, files_efd_map)
 
-    ranked = sorted(candidates.items(), key=lambda kv: (kv[1]["adj_r2"]
-                                                          if not np.isnan(kv[1]["adj_r2"]) else -np.inf),
-                     reverse=True)
+    st.subheader("Equazioni migliori per bucket")
+    for name in bucket_order:
+        if name not in bucket_all_candidates:
+            st.markdown(f"**{name}** — nessun file idoneo, bucket escluso dal fit.")
+            continue
+        st.markdown(f"**{name}** — {bucket_n_files[name]} file, centro bucket = {bucket_centers[name]:.1f} km EFD")
+        ranked = sorted(
+            bucket_all_candidates[name].items(),
+            key=lambda kv: (kv[1]["adj_r2"] if not np.isnan(kv[1]["adj_r2"]) else -np.inf),
+            reverse=True,
+        )
+        best_name = best_candidate(bucket_all_candidates[name])
+        with st.expander(f"Vedi equazioni candidate — {name}"):
+            for cname, c in ranked:
+                star = " 🏆 **migliore**" if cname == best_name else ""
+                st.markdown(f"{cname}{star}")
+                st.latex(c["equation"])
+                st.caption(f"R² = {c['r2']:.3f} · adj. R² = {c['adj_r2']:.3f}")
 
-    for name, c in ranked:
-        star = " 🏆 **migliore**" if name == best_name else ""
-        st.markdown(f"**{name}**{star}")
-        st.latex(c["equation"])
-        st.caption(f"R² = {c['r2']:.3f} · adj. R² = {c['adj_r2']:.3f}")
-
-    # --- Grafico: curva di ogni file (sottile) + il fit migliore in evidenza ---
+    # --- Grafico: curve per bucket (colore diverso) ---
     fig, ax = plt.subplots(figsize=(9, 5))
-    for fname, fdf in decadence_df.groupby("file"):
-        fdf_sorted = fdf.sort_values("efd_accum_km")
-        ax.plot(fdf_sorted["efd_accum_km"], fdf_sorted["deviation_pct"],
-                alpha=0.3, linewidth=1)
+    colors = {bucket_order[0]: "tab:blue", bucket_order[1]: "tab:orange",
+              bucket_order[2]: "tab:green", bucket_order[3]: "tab:red"}
 
-    x_max = decadence_df["efd_accum_km"].max()
-    x_line = np.linspace(0, x_max, 200)
-    colors = {"Lineare": "tab:blue", "Quadratica": "tab:red", "Cubica": "tab:green",
-              "Logaritmica": "tab:orange", "Radice quadrata": "tab:purple"}
-    for name, c in candidates.items():
-        lw = 3 if name == best_name else 1.2
-        alpha = 1.0 if name == best_name else 0.5
-        label = f"{name}{' (migliore)' if name == best_name else ''}"
-        ax.plot(x_line, c["predict"](x_line), color=colors.get(name), linewidth=lw,
-                alpha=alpha, label=label)
+    for name in bucket_order:
+        bdf = decadence_df[decadence_df["bucket"] == name]
+        if bdf.empty:
+            continue
+        for fname, fdf in bdf.groupby("file"):
+            fdf_sorted = fdf.sort_values("efd_pct_accum")
+            ax.plot(fdf_sorted["efd_pct_accum"], fdf_sorted["deviation_pct"],
+                    color=colors[name], alpha=0.15, linewidth=1)
+
+    x_line = np.linspace(0, 100, 200)
+    for name in bucket_order:
+        if name not in bucket_fits:
+            continue
+        pred = bucket_fits[name]["predict"](x_line)
+        ax.plot(x_line, pred, color=colors[name], linewidth=2.5,
+                label=f"{name} (n={bucket_n_files[name]})")
+
     ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
-
-    ax.set_xlabel("EFD accumulato (km)")
+    ax.set_xlabel("EFD accumulato (% del totale del file)")
     ax.set_ylabel("Scostamento EFS rispetto alla media del file (%)")
-    ax.set_title("Decadimento EFS in funzione dell'EFD accumulato")
+    ax.set_title("Decadimento EFS per bucket di lunghezza gara")
     ax.legend(fontsize=8)
     st.pyplot(fig)
 
@@ -419,3 +593,52 @@ else:
             file_name="decadimento_efs_dati.csv",
             mime="text/csv",
         )
+
+    # =======================================================
+    # Predizione sfumata (blended) per una gara target
+    # =======================================================
+    st.divider()
+    st.subheader("🎯 Prova la predizione sfumata (blended)")
+    st.caption(
+        "Inserisci l'EFD totale stimato della gara target e una posizione (% di gara): "
+        "la previsione interpola tra i bucket vicini, cosi' una gara da 99 km e una da "
+        "101 km danno risultati quasi identici invece di un salto netto tra bucket."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        target_efd_km = st.number_input("EFD totale gara target (km)", min_value=1.0, value=80.0, step=5.0)
+    with col2:
+        target_pct = st.slider("Posizione in gara (% EFD accumulato)", 0, 100, 50)
+
+    pred_deviation = predict_blended(target_pct, target_efd_km, bucket_fits, bucket_centers, bucket_order)
+    if np.isnan(pred_deviation):
+        st.warning("Nessun bucket disponibile per la predizione (carica più file idonei).")
+    else:
+        st.metric(
+            f"Scostamento EFS previsto a {target_pct}% di gara",
+            f"{pred_deviation:+.1f}%",
+        )
+
+    # Grafico di verifica continuità: curva blended per il target scelto
+    # sovrapposta alle curve discrete dei bucket
+    fig2, ax2 = plt.subplots(figsize=(9, 4.5))
+    for name in bucket_order:
+        if name not in bucket_fits:
+            continue
+        pred = bucket_fits[name]["predict"](x_line)
+        ax2.plot(x_line, pred, color=colors[name], linewidth=1.2, alpha=0.4,
+                 linestyle="--", label=f"{name} (discreto)")
+
+    blended_line = np.array([
+        predict_blended(p, target_efd_km, bucket_fits, bucket_centers, bucket_order)
+        for p in x_line
+    ])
+    ax2.plot(x_line, blended_line, color="black", linewidth=2.5,
+             label=f"Blended per {target_efd_km:g} km EFD")
+    ax2.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+    ax2.set_xlabel("EFD accumulato (% di gara)")
+    ax2.set_ylabel("Scostamento EFS previsto (%)")
+    ax2.set_title("Verifica continuità: curva blended vs curve discrete per bucket")
+    ax2.legend(fontsize=7)
+    st.pyplot(fig2)
