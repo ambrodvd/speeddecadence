@@ -4,6 +4,8 @@ import plotly.graph_objects as go
 import numpy as np
 import pandas as pd
 from fitparse import FitFile
+import gzip
+import io
 
 MIN_FILE_DURATION_S = 10 * 60  # file sotto questa durata esclusi dall'analisi
 
@@ -59,6 +61,18 @@ def hhmm_to_seconds(t):
         return np.nan
     return h * 3600 + m * 60 + s
 
+def _maybe_gunzip(upload):
+    """Ritorna un file-like leggibile da FitFile, scompattando se gzip.
+    Il riconoscimento è sui magic bytes (1f 8b), non sull'estensione:
+    TrainingPeaks consegna file .fit.gz e altri export hanno estensioni
+    sbagliate o assenti."""
+    data = upload.getvalue()
+    if data[:2] == b"\x1f\x8b":
+        try:
+            data = gzip.decompress(data)
+        except (OSError, EOFError) as e:
+            raise ValueError(f"gzip non valido: {e}")
+    return io.BytesIO(data)
 
 # ---------------------------------------------------------------------------
 # .fit parsing (lat/lon/elevation/tempo — nessun dato cardiaco necessario qui)
@@ -416,7 +430,8 @@ def predict_delta_efs_frozen(efd_pct: float, race_total_efd_km: float) -> float:
 with st.sidebar:
     st.header("Impostazioni")
     uploaded_files = st.file_uploader(
-        "Carica uno o più file .fit", type=["fit"], accept_multiple_files=True
+        "Carica uno o più file .fit (anche .gz)",
+        type=["fit", "gz"], accept_multiple_files=True
     )
     smooth_window = st.slider("Finestra di smoothing quota (punti)", 1, 31, 9, step=2)
     resample_step = st.slider("Passo di ricampionamento (m)", 5, 100, 20, step=5)
@@ -461,7 +476,7 @@ if uploaded_files:
     summary_rows = []
     for f in uploaded_files:
         try:
-            raw = parse_fit(f)
+            raw = parse_fit(_maybe_gunzip(f))
         except Exception as e:
             st.warning(f"⚠️ {f.name}: file .fit illeggibile o corrotto, escluso ({e.__class__.__name__}).")
             continue
@@ -884,7 +899,7 @@ with col_up1:
 with col_up2:
     real_fit = st.file_uploader(
         "🏁 File .fit della gara realmente corsa",
-        type=["fit"], key="compare_real_fit",
+        type=["fit", "gz"], key="compare_real_fit",
     )
 
 if plan_csv is not None and real_fit is not None:
@@ -918,7 +933,7 @@ if plan_csv is not None and real_fit is not None:
 
             # --- elabora il file .fit reale ---
             try:
-                raw_real = parse_fit(real_fit)
+                raw_real = parse_fit(_maybe_gunzip(real_fit))
             except Exception as e:
                 st.error(f"⚠️ File .fit illeggibile o corrotto: {e}")
                 raw_real = pd.DataFrame()
