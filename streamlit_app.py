@@ -77,6 +77,23 @@ def _maybe_gunzip(upload):
 # ---------------------------------------------------------------------------
 # .fit parsing (lat/lon/elevation/tempo — nessun dato cardiaco necessario qui)
 # ---------------------------------------------------------------------------
+@st.cache_data(show_spinner="Parsing e calcolo EFD/EFS...")
+def load_and_process(file_bytes: bytes, smooth_window: int, resample_step_m: float):
+    """Parsing + process in un'unica funzione cached. La chiave è
+    (bytes, parametri): finché non cambiano, i rerun sono lookup istantanei
+    invece di un re-parse completo di tutti i file."""
+    raw = parse_fit(_maybe_gunzip_bytes(file_bytes))
+    if raw.empty or len(raw) < 2:
+        return None, None, None
+    segments, summary = process_track(raw, smooth_window, resample_step_m)
+    return raw, segments, summary
+
+
+def _maybe_gunzip_bytes(data: bytes):
+    if data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    return io.BytesIO(data)
+
 def parse_fit(file_obj) -> pd.DataFrame:
     """Extract lat, lon, elevation, elapsed time (s) per record."""
     fitfile = FitFile(file_obj)
@@ -461,6 +478,17 @@ with st.sidebar:
 st.title("SPEED DECADENCE")
 st.caption("EFD/EFS secondo il modello del costo energetico di Minetti et al. (2002).")
 
+# --- Quali analisi eseguire ---------------------------------------------
+# Con decine di file ogni analisi costa secondi: spente di default, si
+# accendono una alla volta. Sono checkbox e non bottoni perché un bottone
+# è True solo nel rerun del click e il risultato sparirebbe al widget dopo.
+st.subheader("⚙️ Analisi da eseguire")
+cR1, cR2 = st.columns(2)
+run_decadence = cR1.checkbox("📉 Decadimento EFS per bucket", value=False,
+                             key="run_decadence")
+run_slopes = cR2.checkbox("📐 Studio pendenze FC / EFS", value=False,
+                          key="run_slopes")
+
 bucket_order, bucket_bounds = get_bucket_definitions(thr1, thr2, thr3)
 bucket_fits, bucket_centers = {}, {}  # inizializzati qui, sovrascritti più sotto se ci sono dati di training
 
@@ -476,19 +504,14 @@ if uploaded_files:
     summary_rows = []
     for f in uploaded_files:
         try:
-            raw = parse_fit(_maybe_gunzip(f))
+            raw, segments, summary = load_and_process(
+                f.getvalue(), smooth_window, resample_step)
         except Exception as e:
-            st.warning(f"⚠️ {f.name}: file .fit illeggibile o corrotto, escluso ({e.__class__.__name__}).")
+            st.warning(f"⚠️ {f.name}: file illeggibile o errore di elaborazione, escluso ({e.__class__.__name__}).")
             continue
 
-        if raw.empty or len(raw) < 2:
+        if raw is None:
             st.warning(f"⚠️ {f.name}: nessun dato GPS valido, file escluso.")
-            continue
-
-        try:
-            segments, summary = process_track(raw, smooth_window, resample_step)
-        except Exception as e:
-            st.warning(f"⚠️ {f.name}: errore durante l'elaborazione, escluso ({e.__class__.__name__}).")
             continue
 
         if segments is None:
@@ -571,7 +594,7 @@ st.caption(
 
 decadence_rows = []
 
-for fname, seg in per_file_segments.items():
+for fname, seg in (per_file_segments.items() if run_decadence else []):
     total_time_s = float(seg["dt_s"].sum())
     if total_time_s < MIN_FILE_DURATION_S:
         continue  # file troppo corto, escluso dall'analisi del decadimento
@@ -609,7 +632,9 @@ for fname, seg in per_file_segments.items():
             "deviation_pct": deviation_pct,
         })
 
-if not decadence_rows:
+if not run_decadence:
+    st.info("☝️ Spunta **📉 Decadimento EFS per bucket** in cima alla pagina per eseguire l'analisi.")
+elif not decadence_rows:
     st.info(
         f"Nessun file idoneo per l'analisi del decadimento (serve almeno un file "
         f">= {MIN_FILE_DURATION_S // 60} minuti)."
@@ -756,7 +781,9 @@ else:
 st.divider()
 st.header("📐 Studio pendenze: FC e EFS vs tempo")
 
-if not per_file_segments:
+if not run_slopes:
+    st.info("☝️ Spunta **📐 Studio pendenze FC / EFS** in cima alla pagina per eseguirlo.")
+elif not per_file_segments:
     st.info("Carica dei file .fit per eseguire lo studio.")
 else:
     dist_metric = st.radio(
