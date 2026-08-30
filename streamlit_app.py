@@ -1318,14 +1318,17 @@ def ef_descriptive_stats(summary_df):
     return pd.DataFrame(rows)
 
 
-def ef_group_stats(summary_df, by, label):
+def ef_group_stats(summary_df, by, label, min_groups=2, order=None):
     """Aggregazione dell'EF per una chiave di raggruppamento (atleta, bucket
-    di lunghezza). Ritorna None se la chiave manca o se c'è un solo gruppo:
-    con un gruppo solo la tabella non aggiunge niente al riepilogo."""
+    di lunghezza). min_groups=2 sopprime la tabella quando c'è un gruppo solo
+    (non aggiungerebbe nulla al riepilogo); i bucket usano min_groups=1 perché
+    lì la tabella serve comunque come vista per distanza. `order` impone
+    l'ordine delle righe (i bucket vanno dal più corto al più lungo, non in
+    ordine alfabetico)."""
     if by not in summary_df.columns:
         return None
     sub = summary_df.dropna(subset=["EF medio"])
-    if sub.empty or sub[by].nunique() < 2:
+    if sub.empty or sub[by].nunique() < min_groups:
         return None
 
     g = (sub.groupby(by, dropna=False)
@@ -1337,6 +1340,12 @@ def ef_group_stats(summary_df, by, label):
                  delta_mean=("Delta", "mean"),
                  efd_mean=("EFD (km)", "mean"))
             .reset_index())
+
+    if order:
+        rank = {name: i for i, name in enumerate(order)}
+        g = (g.assign(_ord=g[by].map(lambda v: rank.get(v, len(rank))))
+               .sort_values("_ord").drop(columns=["_ord"]).reset_index(drop=True))
+
     return g.rename(columns={
         by: label, "N": "N file",
         "ef_mean": "EF medio (media)", "ef_median": "EF medio (mediana)",
@@ -1373,7 +1382,8 @@ def _df_to_html(df):
                       na_rep="—")
 
 
-def build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df):
+def build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df,
+                  n_excluded=0):
     """Report HTML autoconsistente: tabella riassuntiva + un grafico e le
     metriche per ciascun file. plotly.js caricato una volta sola da CDN,
     quindi le figure vanno inserite con include_plotlyjs=False."""
@@ -1396,9 +1406,10 @@ def build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df):
         "unità di sforzo relativo (1.0 = a soglia). Essendo la FC normalizzata "
         "sulla soglia di ciascun atleta, il numero è confrontabile tra atleti "
         "con soglie diverse.</p>",
-        f"<p class='meta'>File analizzati: <b>{len(blocks)}</b></p>",
-        "<h2>Riepilogo per file</h2>",
-        _df_to_html(summary_df),
+        f"<p class='meta'>File analizzati: <b>{len(blocks)}</b>"
+        + (f", di cui <b>{n_excluded}</b> esclusi dalle statistiche"
+           if n_excluded else "")
+        + ".</p>",
     ]
 
     if stats_df is not None and not stats_df.empty:
@@ -1420,10 +1431,16 @@ def build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df):
 
     for b in blocks:
         s = b["stats"]
-        parts.append(f"<h2>{b['name']}</h2>")
+        parts.append(f"<h2>{b['name']}"
+                     + (" <small>(escluso dalle statistiche)</small>"
+                        if b.get("excluded") else "")
+                     + "</h2>")
         parts.append(
-            "<p class='meta'>Soglia FC (z4): "
-            f"<b>{b['threshold']:.0f} bpm</b>"
+            "<p class='meta'>"
+            f"EFD <b>{b.get('efd_km', float('nan')):.2f} km</b> &middot; "
+            f"durata <b>{b.get('durata', '—')}</b> &middot; "
+            f"bucket <b>{b.get('bucket', '—')}</b> &middot; "
+            f"soglia FC (z4) <b>{b['threshold']:.0f} bpm</b>"
             + (f" &middot; atleta: {b['athlete']}" if b.get("athlete") else "")
             + f" &middot; finestre valide: {s['n_windows']}</p>"
         )
@@ -1436,12 +1453,15 @@ def build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df):
         parts.append(b["fig"].to_html(full_html=False, include_plotlyjs=False,
                                       default_width="100%"))
 
+    parts.append("<h2>Riepilogo per file</h2>")
+    parts.append(_df_to_html(summary_df))
+
     parts.append("</body></html>")
     return "\n".join(parts)
 
 
 def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
-                       per_file_bucket):
+                       per_file_bucket, bucket_order):
     st.header("💓 Efficiency Factor per file")
     st.caption(
         f"EF = EFS ÷ (FC / soglia), su finestra mobile di {EF_WIN_MIN} minuti con passo "
@@ -1454,15 +1474,25 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
         return
 
     # --- 1) una casella di upload per ogni file .fit caricato ---
+    # Qui sta anche l'interruttore di esclusione: le statistiche vengono
+    # stampate PRIMA dei grafici, quindi i controlli che le influenzano
+    # devono trovarsi sopra, altrimenti si modifica un risultato già letto.
     st.subheader("1. Zone FC per file")
-    zones_by_file = {}
-    for i, fname in enumerate(per_file_raw):
-        c_name, c_up = st.columns([1, 1.4])
+    st.caption(
+        "Spunta **Escludi** per togliere un file dalle statistiche aggregate "
+        "(dati sporchi, fascia cardio ballerina, gara interrotta): il grafico "
+        "resta comunque visibile più sotto."
+    )
+    zones_by_file, excluded_files = {}, set()
+    for fname in per_file_raw:
+        c_name, c_up, c_ex = st.columns([1, 1.3, 0.5])
         c_name.markdown(f"**{fname}**")
         csv_file = c_up.file_uploader(
             f"CSV zone FC — {fname}", type=["csv"],
-            key=f"ef_zones_csv_{i}", label_visibility="collapsed",
+            key=f"ef_zones_csv_{fname}", label_visibility="collapsed",
         )
+        if c_ex.checkbox("Escludi", key=f"ef_exclude_{fname}"):
+            excluded_files.add(fname)
         if csv_file is None:
             continue
         zones, err = read_hr_zones_csv(csv_file)
@@ -1478,8 +1508,7 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
                 "Il CSV deve contenere una colonna `z4` (FC di soglia).")
         return
 
-    # --- 2) calcolo EF sui soli file con soglia disponibile ---
-    st.subheader("2. Efficiency Factor")
+    # --- calcolo EF sui soli file con soglia disponibile ---
     blocks, summary_rows = [], []
     for fname, zones in zones_by_file.items():
         ef_df = compute_ef_series(per_file_raw[fname], per_file_segments[fname],
@@ -1494,21 +1523,29 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
             ef_df, per_file_raw[fname],
             f"{fname} — Efficiency Factor (finestra {EF_WIN_MIN} min)",
         )
+        summ = per_file_summary.get(fname, {})
+        total_time_s = summ.get("total_time_s", np.nan)
+        efd_km = summ.get("efd_m", np.nan) / 1000
+        bucket_name = per_file_bucket.get(fname, ("—", np.nan))[0]
+
         blocks.append({
             "name": fname, "ef_df": ef_df, "fig": fig, "stats": stats,
             "threshold": zones["threshold"], "athlete": zones.get("athlete"),
+            "excluded": fname in excluded_files,
+            "efd_km": efd_km, "durata": seconds_to_hhmm(total_time_s),
+            "bucket": bucket_name,
         })
 
-        summ = per_file_summary.get(fname, {})
-        total_time_s = summ.get("total_time_s", np.nan)
         summary_rows.append({
             "File": fname,
+            "Escluso": "✖" if fname in excluded_files else "",
+            "_excl": fname in excluded_files,
             "Atleta": zones.get("athlete", "—"),
-            "Bucket": per_file_bucket.get(fname, ("—", np.nan))[0],
+            "Bucket": bucket_name,
             "Soglia (bpm)": zones["threshold"],
             "Durata": seconds_to_hhmm(total_time_s),
             "Durata (h)": total_time_s / 3600 if np.isfinite(total_time_s) else np.nan,
-            "EFD (km)": summ.get("efd_m", np.nan) / 1000,
+            "EFD (km)": efd_km,
             "EF 1ª metà": stats["ef_first_half"],
             "EF 2ª metà": stats["ef_second_half"],
             "Delta": stats["ef_delta"],
@@ -1520,11 +1557,67 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
         st.info("Nessun file idoneo al calcolo dell'EF.")
         return
 
-    summary_df = pd.DataFrame(summary_rows)
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    full_df = pd.DataFrame(summary_rows)
+    summary_df = full_df.drop(columns=["_excl"])
+    stats_source = full_df[~full_df["_excl"]].drop(columns=["_excl"])
+    n_excluded = int(full_df["_excl"].sum())
 
+    # --- 2) statistiche sull'insieme dei file (in cima, prima dei grafici) ---
+    st.divider()
+    st.subheader("2. Statistiche sull'insieme dei file")
+    if stats_source.empty:
+        st.warning("Tutti i file sono esclusi: nessuna statistica da calcolare.")
+        stats_df, group_tables, corr_df = pd.DataFrame(), [], pd.DataFrame()
+    else:
+        st.caption(
+            f"**{len(stats_source)} file nelle statistiche**"
+            + (f" ({n_excluded} esclusi manualmente)" if n_excluded else "")
+            + ". Un file = un'osservazione. La moda è calcolata sui valori "
+            "arrotondati a 0.1 e mostrata solo se almeno due file cadono sullo "
+            "stesso valore: su misure continue una moda \"vera\" non esiste quasi mai."
+        )
+        stats_df = ef_descriptive_stats(stats_source)
+        st.dataframe(stats_df, use_container_width=True, hide_index=True)
+
+        group_tables = []
+
+        # Bucket: sempre mostrato (min_groups=1) e ordinato per lunghezza
+        # crescente, non alfabeticamente. Sono gli stessi bucket impostati
+        # nella sidebar, quindi le soglie si cambiano da lì.
+        gdf = ef_group_stats(stats_source, "Bucket", "Bucket",
+                             min_groups=1, order=bucket_order)
+        if gdf is not None:
+            group_tables.append(("bucket di lunghezza gara", gdf))
+            st.markdown("**EF per bucket di lunghezza gara**")
+            st.dataframe(gdf, use_container_width=True, hide_index=True)
+            st.caption("Bucket definiti dalle soglie EFD nella sidebar.")
+
+        gdf = ef_group_stats(stats_source, "Atleta", "Atleta")
+        if gdf is not None:
+            group_tables.append(("atleta", gdf))
+            st.markdown("**EF per atleta**")
+            st.dataframe(gdf, use_container_width=True, hide_index=True)
+
+        corr_df = ef_correlations(stats_source)
+        if corr_df is not None and not corr_df.empty:
+            st.markdown("**Correlazioni**")
+            st.dataframe(corr_df, use_container_width=True, hide_index=True)
+            st.caption(
+                "Pearson su pochi file è instabile: leggilo come indizio di una "
+                "relazione (es. gare più lunghe = calo di EF maggiore), non come prova."
+            )
+
+    # --- 3) grafici per file ---
+    st.divider()
+    st.subheader("3. Grafici per file")
     for b in blocks:
-        st.markdown(f"#### {b['name']}")
+        st.markdown(f"#### {b['name']}"
+                    + ("  ·  *escluso dalle statistiche*" if b["excluded"] else ""))
+        st.caption(
+            f"EFD **{b['efd_km']:.2f} km** · durata **{b['durata']}** · "
+            f"bucket **{b['bucket']}** · soglia FC **{b['threshold']:.0f} bpm**"
+            + (f" · atleta **{b['athlete']}**" if b.get("athlete") else "")
+        )
         st.plotly_chart(b["fig"], use_container_width=True,
                         key=f"ef_chart_{b['name']}")
         s = b["stats"]
@@ -1533,16 +1626,17 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
         c2.metric("EF 2ª metà", f"{s['ef_second_half']:.2f}", f"{s['ef_delta']:+.2f}")
         c3.metric("EF medio gara", f"{s['ef_mean']:.2f}")
         st.caption(
-            f"Soglia {b['threshold']:.0f} bpm. Un EF di 12.3 significa 12.3 km/h "
-            "equivalenti pianeggianti se l'atleta corresse esattamente a soglia."
+            "Un EF di 12.3 significa 12.3 km/h equivalenti pianeggianti se "
+            "l'atleta corresse esattamente a soglia."
         )
 
     # I dati per finestra non vengono più stampati (né a schermo né nel report):
     # con molti file erano decine di tabelle e un HTML enorme. Restano
     # disponibili in un unico CSV per chi vuole rilavorarli.
     windows_df = pd.concat(
-        [b["ef_df"].assign(file=b["name"]) for b in blocks], ignore_index=True
-    )[["file", "t_h", "ef", "hr_bpm", "hr_rel_pct", "efs_kmh"]]
+        [b["ef_df"].assign(file=b["name"], escluso=b["excluded"]) for b in blocks],
+        ignore_index=True
+    )[["file", "escluso", "t_h", "ef", "hr_bpm", "hr_rel_pct", "efs_kmh"]]
     st.download_button(
         "📥 Scarica i dati EF per finestra, tutti i file (CSV)",
         data=windows_df.to_csv(index=False).encode("utf-8"),
@@ -1550,45 +1644,11 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
         mime="text/csv",
     )
 
-    # --- 3) statistiche sull'insieme dei file ---
-    st.divider()
-    st.subheader("3. Statistiche sull'insieme dei file")
-    st.caption(
-        f"**{len(blocks)} file analizzati.** Un file = un'osservazione. "
-        "La moda è calcolata sui valori arrotondati a 0.1 e mostrata solo se "
-        "almeno due file cadono sullo stesso valore: su misure continue una "
-        "moda \"vera\" non esiste quasi mai."
-    )
-    stats_df = ef_descriptive_stats(summary_df)
-    st.dataframe(stats_df, use_container_width=True, hide_index=True)
-
-    group_tables = []
-    for by, label in [("Atleta", "atleta"), ("Bucket", "bucket di lunghezza")]:
-        gdf = ef_group_stats(summary_df, by, label.capitalize())
-        if gdf is not None:
-            group_tables.append((label, gdf))
-            st.markdown(f"**EF per {label}**")
-            st.dataframe(gdf, use_container_width=True, hide_index=True)
-    if not group_tables:
-        st.caption(
-            "Nessun raggruppamento utile: i file appartengono tutti allo stesso "
-            "atleta e allo stesso bucket di lunghezza. Le tabelle per gruppo "
-            "compaiono da sole quando i file si distribuiscono su più valori."
-        )
-
-    corr_df = ef_correlations(summary_df)
-    if corr_df is not None and not corr_df.empty:
-        st.markdown("**Correlazioni**")
-        st.dataframe(corr_df, use_container_width=True, hide_index=True)
-        st.caption(
-            "Pearson su pochi file è instabile: leggilo come indizio di una "
-            "relazione (es. gare più lunghe = calo di EF maggiore), non come prova."
-        )
-
     # --- 4) report HTML unico ---
     st.divider()
     st.subheader("4. Report HTML")
-    html_report = build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df)
+    html_report = build_ef_html(blocks, summary_df, stats_df, group_tables,
+                                corr_df, n_excluded)
     st.download_button(
         "📥 Scarica il report HTML",
         data=html_report.encode("utf-8"),
@@ -1598,6 +1658,17 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
     st.caption(
         "Il file è autoconsistente (plotly.js da CDN): si apre in qualsiasi browser "
         "e contiene gli stessi grafici e tabelle mostrati qui sopra."
+    )
+
+    # --- 5) riepilogo per file, in fondo ---
+    st.divider()
+    st.subheader("5. Riepilogo per file")
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "📥 Scarica il riepilogo (CSV)",
+        data=summary_df.to_csv(index=False).encode("utf-8"),
+        file_name="efficiency_factor_riepilogo.csv",
+        mime="text/csv",
     )
 
 
@@ -1635,8 +1706,8 @@ with st.sidebar:
         "relativa di gara. La lunghezza assoluta del file determina invece il bucket."
     )
 
-st.title("SPEED DECADENCE")
-st.caption("EFD/EFS secondo il modello del costo energetico di Minetti et al. (2002).")
+st.title("👁️‍🗨️ AMBRO BIG DATA BROTHER 👁️‍🗨️")
+st.info("This is where your data gets crunched")
 
 bucket_order, bucket_bounds = get_bucket_definitions(thr1, thr2, thr3)
 
@@ -1769,6 +1840,6 @@ with tab_ef:
     run_ef = st.checkbox(RUN_PROMPT, value=False, key="run_ef")
     if run_ef:
         render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
-                           per_file_bucket)
+                           per_file_bucket, bucket_order)
     else:
         st.info("☝️ Spunta la casella per eseguire l'analisi dell'Efficiency Factor.")
