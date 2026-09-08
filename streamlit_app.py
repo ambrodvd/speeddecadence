@@ -6,6 +6,13 @@ import pandas as pd
 from fitparse import FitFile
 import gzip
 import io
+from cpet_steady_state import render_cpet_analysis
+
+st.set_page_config(
+    page_title="AMBRO BIG DATA BROTHER",
+    page_icon="👁️‍🗨️",
+    layout="wide",
+)
 
 MIN_FILE_DURATION_S = 10 * 60  # file sotto questa durata esclusi dall'analisi
 
@@ -1807,11 +1814,12 @@ if per_file_bucket:
 # solo nel rerun del click e il risultato sparirebbe al widget successivo.
 st.divider()
 
-tab_dec, tab_slope, tab_cmp, tab_ef = st.tabs([
+tab_dec, tab_slope, tab_cmp, tab_ef, tab_cpet = st.tabs([
     "📉 Decadimento EFS per bucket",
     "📐 Studio pendenze FC / EFS",
     "🆚 Race plan vs gara reale",
     "💓 Efficiency Factor",
+    "🫁 CPET step & steady state",
 ])
 
 with tab_dec:
@@ -1841,5 +1849,10 @@ with tab_ef:
     if run_ef:
         render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
                            per_file_bucket, bucket_order)
+
+with tab_cpet:
+    run_cpet = st.checkbox(RUN_PROMPT, value=False, key="run_cpet")
+    if run_cpet:
+        render_cpet_analysis()
     else:
-        st.info("☝️ Spunta la casella per eseguire l'analisi dell'Efficiency Factor.")
+        st.info("☝️ Spunta la casella per eseguire l'analisi CPET a step.")
