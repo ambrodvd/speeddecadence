@@ -63,6 +63,15 @@ CURATED_RAW = {
     "mrsi_cmj_re":            ("cmrj", "rebound rsi modified"),
 }
 
+# Metriche derivate per ripetizione della Force Plate app (campo "derive"
+# in METRICS): rapporto calcolato su ogni ripetizione, poi media di seduta.
+# Chiave = stessa chiave di METRICS, così potrà diventare un pop_key.
+DERIVED_PER_REP = {
+    "imtp_rel_peak_force": ("imtp", "peak force", "body mass"),
+    "sj_net_rel_impulse":  ("sj", "net impulse", "body mass"),
+    "cmj_net_rel_impulse": ("cmj", "net impulse", "body mass"),
+}
+
 META_COLS = {"Nome", "Sesso", "Data test", "File", "Jump Type", "Indice Ripetizione"}
 DEFAULT_MIN_N = 5
 
@@ -124,13 +133,16 @@ def session_values(df, var_cols):
             if pd.notna(mean):
                 out[(jt, var)] = float(mean)
 
-        # IMTP Rel Peak Force: rapporto per ripetizione, poi media (come
-        # il derive della Force Plate app, non rapporto delle medie).
-        if jt == "imtp" and {"peak force", "body mass"} <= set(num.columns):
-            rel = (num["peak force"] / num["body mass"]).replace([math.inf, -math.inf], pd.NA)
-            rel = pd.to_numeric(rel, errors="coerce").dropna()
-            if len(rel):
-                out[("derived", "imtp_rel_peak_force")] = float(rel.mean())
+        # Rapporti per ripetizione, poi media (come il derive della Force
+        # Plate app, non rapporto delle medie).
+        for key, (d_jt, num_var, den_var) in DERIVED_PER_REP.items():
+            if jt != d_jt or not {num_var, den_var} <= set(num.columns):
+                continue
+            ratio = pd.to_numeric(
+                (num[num_var] / num[den_var]).replace([math.inf, -math.inf], pd.NA),
+                errors="coerce").dropna()
+            if len(ratio):
+                out[("derived", key)] = float(ratio.mean())
 
     # Indici cross-test: rapporto delle medie di seduta, come build_results().
     cmj_pk, imtp_pk = out.get(("cmj", "peak propulsive force")), out.get(("imtp", "peak force"))
@@ -191,12 +203,16 @@ def build_extra(sessions, min_n):
     """Righe per le altre metriche: tutte le variabili registrate tranne quelle già
     coperte da DEFAULT_POP. Sotto min_n il valore è None (nessun default)."""
     used = set(CURATED_RAW.values())
-    keys = sorted({k for s in sessions for k in s["values"]
-                   if k[0] != "derived" and k not in used})
+    raw_keys = sorted({k for s in sessions for k in s["values"]
+                       if k[0] != "derived" and k not in used})
+    # Derivate non presenti fra le 13 costanti (es. net rel impulse): in
+    # testa, con la chiave di METRICS.
+    derived_keys = [("derived", k) for k in DERIVED_PER_REP if k not in CURRENT_DEFAULT_POP]
+    keys = derived_keys + raw_keys
     rows = []
     for jt, var in keys:
         st_ = stats_by_sex(sessions, (jt, var))
-        row = dict(key=f"{jt}::{var}")
+        row = dict(key=var if jt == "derived" else f"{jt}::{var}")
         for sex, suf in (("M", "m"), ("F", "f")):
             n, m, sd = st_[sex]
             ok = n >= min_n and m is not None and sd is not None
@@ -239,7 +255,8 @@ def format_pop_block(curated, extra):
     if extra:
         lines.append("")
         lines.append("    # " + "=" * 70)
-        lines.append("    # ALTRE METRICHE — chiave 'tipo di test::variabile'.")
+        lines.append("    # ALTRE METRICHE — derivate (chiave di METRICS), poi grezze")
+        lines.append("    # con chiave 'tipo di test::variabile'.")
         lines.append("    # None = troppe poche sedute per quel sesso (nessun default).")
         lines.append("    # " + "=" * 70)
         lines += [_format_line(r, key_w, _comment_extra(r)) for r in extra]
