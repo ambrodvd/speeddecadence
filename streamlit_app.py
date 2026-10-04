@@ -7,6 +7,7 @@ from fitparse import FitFile
 import gzip
 import io
 from cpet_steady_state import render_cpet_analysis
+from forceplate_norms import render_forceplate_norms
 
 st.set_page_config(
     page_title="AMBRO BIG DATA BROTHER",
@@ -1814,12 +1815,13 @@ if per_file_bucket:
 # solo nel rerun del click e il risultato sparirebbe al widget successivo.
 st.divider()
 
-tab_dec, tab_slope, tab_cmp, tab_ef, tab_cpet = st.tabs([
+tab_dec, tab_slope, tab_cmp, tab_ef, tab_cpet, tab_fpn = st.tabs([
     "📉 Decadimento EFS per bucket",
     "📐 Studio pendenze FC / EFS",
     "🆚 Race plan vs gara reale",
     "💓 Efficiency Factor",
     "🫁 CPET step & steady state",
+    "🏋️ Norme Force Plate",
 ])
 
 with tab_dec:
@@ -1856,3 +1858,10 @@ with tab_cpet:
         render_cpet_analysis()
     else:
         st.info("☝️ Spunta la casella per eseguire l'analisi CPET a step.")
+
+with tab_fpn:
+    run_fpn = st.checkbox(RUN_PROMPT, value=False, key="run_fpn")
+    if run_fpn:
+        render_forceplate_norms()
+    else:
+        st.info("☝️ Spunta la casella per calcolare le norme di popolazione Force Plate.")
