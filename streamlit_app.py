@@ -8,6 +8,10 @@ import gzip
 import io
 from cpet_steady_state import render_cpet_analysis
 from forceplate_norms import render_forceplate_norms
+from hr_summary import render as render_hr_summary
+
+with tab_fc:  # new tab
+    render_hr_summary(uploaded_files)
 
 st.set_page_config(
     page_title="AMBRO BIG DATA BROTHER",
