@@ -10,9 +10,6 @@ from cpet_steady_state import render_cpet_analysis
 from forceplate_norms import render_forceplate_norms
 from hr_summary import render as render_hr_summary
 
-with tab_fc:  # new tab
-    render_hr_summary(uploaded_files)
-
 st.set_page_config(
     page_title="AMBRO BIG DATA BROTHER",
     page_icon="👁️‍🗨️",
@@ -1819,13 +1816,14 @@ if per_file_bucket:
 # solo nel rerun del click e il risultato sparirebbe al widget successivo.
 st.divider()
 
-tab_dec, tab_slope, tab_cmp, tab_ef, tab_cpet, tab_fpn = st.tabs([
+tab_dec, tab_slope, tab_cmp, tab_ef, tab_cpet, tab_fpn, tab_fc = st.tabs([
     "📉 Decadimento EFS per bucket",
     "📐 Studio pendenze FC / EFS",
     "🆚 Race plan vs gara reale",
     "💓 Efficiency Factor",
     "🫁 CPET step & steady state",
     "🏋️ Norme Force Plate",
+    "❤️ Riepilogo FC",
 ])
 
 with tab_dec:
@@ -1869,3 +1867,10 @@ with tab_fpn:
         render_forceplate_norms()
     else:
         st.info("☝️ Spunta la casella per calcolare le norme di popolazione Force Plate.")
+
+with tab_fc:
+    run_fc = st.checkbox(RUN_PROMPT, value=False, key="run_fc")
+    if run_fc:
+        render_hr_summary(per_file_raw)
+    else:
+        st.info("☝️ Spunta la casella per calcolare il riepilogo della frequenza cardiaca.")
