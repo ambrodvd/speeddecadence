@@ -98,12 +98,18 @@ def _maybe_gunzip(upload):
 # ---------------------------------------------------------------------------
 # .fit parsing (lat/lon/elevation/tempo — nessun dato cardiaco necessario qui)
 # ---------------------------------------------------------------------------
+@st.cache_data(show_spinner="Lettura file .fit...")
+def load_raw(file_bytes: bytes) -> pd.DataFrame:
+    """Solo parsing (niente EFD/EFS): basta per le analisi che usano FC e tempo."""
+    return parse_fit(_maybe_gunzip_bytes(file_bytes))
+
+
 @st.cache_data(show_spinner="Parsing e calcolo EFD/EFS...")
 def load_and_process(file_bytes: bytes, smooth_window: int, resample_step_m: float):
     """Parsing + process in un'unica funzione cached. La chiave è
     (bytes, parametri): finché non cambiano, i rerun sono lookup istantanei
     invece di un re-parse completo di tutti i file."""
-    raw = parse_fit(_maybe_gunzip_bytes(file_bytes))
+    raw = load_raw(file_bytes)
     if raw.empty or len(raw) < 2:
         return None, None, None
     segments, summary = process_track(raw, smooth_window, resample_step_m)
@@ -1728,7 +1734,13 @@ per_file_summary = {}    # filename -> summary dict
 per_file_bucket = {}     # filename -> (bucket_name, efd_totale_km)
 per_file_raw = {}        # filename -> raw record dataframe (serve per la FC)
 
-if uploaded_files:
+# Il calcolo EFD/EFS (pesante) parte solo se è attiva un'analisi che lo usa.
+# I checkbox sono in fondo alla pagina, ma il loro valore è già in
+# session_state all'inizio del rerun scatenato dal click.
+EFD_ANALYSIS_KEYS = ("run_decadence", "run_slopes", "run_ef")
+needs_efd = any(st.session_state.get(k, False) for k in EFD_ANALYSIS_KEYS)
+
+if uploaded_files and needs_efd:
     summary_rows = []
     for f in uploaded_files:
         try:
@@ -1769,6 +1781,12 @@ if uploaded_files:
     if summary_rows:
         st.subheader("Riepilogo file")
         st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+elif uploaded_files:
+    st.info(
+        f"{len(uploaded_files)} file caricati. Il calcolo EFD/EFS parte solo quando "
+        "attivi un'analisi che lo richiede (decadimento EFS, studio pendenze, "
+        "Efficiency Factor)."
+    )
 else:
     st.info("Carica uno o più file .fit dalla sidebar per iniziare.")
 
@@ -1871,6 +1889,15 @@ with tab_fpn:
 with tab_fc:
     run_fc = st.checkbox(RUN_PROMPT, value=False, key="run_fc")
     if run_fc:
-        render_hr_summary(per_file_raw)
+        fc_raw = {}
+        for f in uploaded_files or []:
+            try:
+                raw = load_raw(f.getvalue())  # solo parsing, niente EFD/EFS
+            except Exception as e:
+                st.warning(f"⚠️ {f.name}: file illeggibile, escluso ({e.__class__.__name__}).")
+                continue
+            if not raw.empty:
+                fc_raw[f.name] = raw
+        render_hr_summary(fc_raw)
     else:
         st.info("☝️ Spunta la casella per calcolare il riepilogo della frequenza cardiaca.")

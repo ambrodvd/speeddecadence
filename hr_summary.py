@@ -2,14 +2,14 @@
 
 Per ogni file: media FC totale, media della prima e della seconda metà
 (divise a metà della durata) e differenza % seconda vs prima metà.
-
-Usa i record grezzi già parsati dal main app (per_file_raw), quindi
-nessun nuovo parsing e i file .gz funzionano come nelle altre tab.
+Sotto, statistiche descrittive sull'insieme dei file (stesso schema
+della tab Efficiency Factor: un file = un'osservazione).
 
 Uso nel main app:
     from hr_summary import render as render_hr_summary
-    render_hr_summary(per_file_raw)
+    render_hr_summary(fc_raw)   # dict nome_file -> dataframe con timestamp, hr
 """
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -20,6 +20,14 @@ RIGA_PRIMA = "Prima metà"
 RIGA_SECONDA = "Seconda metà"
 RIGA_DIFF = "Differenza"
 RIGHE = [RIGA_MEDIA, RIGA_PRIMA, RIGA_SECONDA, RIGA_DIFF]
+
+# Nomi delle metriche nella tabella statistiche (con unità)
+NOMI_STAT = {
+    RIGA_MEDIA: "FC media totale (bpm)",
+    RIGA_PRIMA: "FC 1ª metà (bpm)",
+    RIGA_SECONDA: "FC 2ª metà (bpm)",
+    RIGA_DIFF: "Differenza (%)",
+}
 
 
 def riepilogo_fc(raw: pd.DataFrame) -> dict:
@@ -53,6 +61,39 @@ def costruisci_tabella(per_file_raw: dict) -> pd.DataFrame:
     return tab.astype(float)
 
 
+def statistiche_insieme(tab: pd.DataFrame) -> pd.DataFrame:
+    """Statistiche descrittive per metrica, un file = un'osservazione.
+    Stesse colonne della tab Efficiency Factor. La moda si calcola sui valori
+    arrotondati a 0.1 e si riporta solo se almeno due file coincidono."""
+    rows = []
+    for metrica in RIGHE:
+        s = tab.loc[metrica].dropna()
+        if s.empty:
+            continue
+
+        counts = s.round(1).value_counts()
+        moda = float(counts.index[0]) if len(counts) and counts.iloc[0] > 1 else np.nan
+
+        sd = float(s.std(ddof=1)) if len(s) > 1 else np.nan
+        mean = float(s.mean())
+        rows.append({
+            "Metrica": NOMI_STAT[metrica],
+            "N": int(s.count()),
+            "Min": float(s.min()),
+            "Max": float(s.max()),
+            "Range": float(s.max() - s.min()),
+            "Media": mean,
+            "Mediana": float(s.median()),
+            "Moda (arr. 0.1)": moda,
+            "Dev. std": sd,
+            "CV %": (sd / mean * 100.0) if (np.isfinite(sd) and mean != 0) else np.nan,
+            "p25": float(s.quantile(0.25)),
+            "p75": float(s.quantile(0.75)),
+            "IQR": float(s.quantile(0.75) - s.quantile(0.25)),
+        })
+    return pd.DataFrame(rows)
+
+
 def _colore_diff(riga: pd.Series) -> list:
     if riga.name != RIGA_DIFF:
         return [""] * len(riga)
@@ -84,6 +125,8 @@ def render(per_file_raw: dict) -> None:
         st.info("Carica uno o più file .fit dalla sidebar per eseguire questa analisi.")
         return
 
+    # --- 1) tabella per file ---
+    st.subheader("1. Riepilogo per file")
     tab = costruisci_tabella(per_file_raw)
     st.dataframe(stile_tabella(tab), use_container_width=True)
     st.caption(
@@ -95,5 +138,30 @@ def render(per_file_raw: dict) -> None:
         "📥 Scarica riepilogo FC (CSV)",
         data=tab.round(1).to_csv().encode("utf-8"),
         file_name="riepilogo_fc.csv",
+        mime="text/csv",
+    )
+
+    # --- 2) statistiche sull'insieme dei file ---
+    st.divider()
+    st.subheader("2. Statistiche sull'insieme dei file")
+    stats_df = statistiche_insieme(tab)
+    if stats_df.empty:
+        st.warning("Nessun file con dati di frequenza cardiaca: nessuna statistica da calcolare.")
+        return
+
+    n_con_fc = int(tab.loc[RIGA_MEDIA].notna().sum())
+    n_senza_fc = len(tab.columns) - n_con_fc
+    st.caption(
+        f"**{n_con_fc} file nelle statistiche**"
+        + (f" ({n_senza_fc} senza FC, esclusi)" if n_senza_fc else "")
+        + ". Un file = un'osservazione. La moda è calcolata sui valori "
+        "arrotondati a 0.1 e mostrata solo se almeno due file cadono sullo "
+        "stesso valore: su misure continue una moda \"vera\" non esiste quasi mai."
+    )
+    st.dataframe(stats_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "📥 Scarica statistiche FC (CSV)",
+        data=stats_df.to_csv(index=False).encode("utf-8"),
+        file_name="statistiche_fc.csv",
         mime="text/csv",
     )
