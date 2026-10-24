@@ -3,15 +3,15 @@
 Per ogni file: media FC totale, media della prima e della seconda metà
 (divise a metà della durata) e differenza % seconda vs prima metà.
 
+Usa i record grezzi già parsati dal main app (per_file_raw), quindi
+nessun nuovo parsing e i file .gz funzionano come nelle altre tab.
+
 Uso nel main app:
     from hr_summary import render as render_hr_summary
-    render_hr_summary(uploaded_files)
+    render_hr_summary(per_file_raw)
 """
-import io
-
 import pandas as pd
 import streamlit as st
-from fitparse import FitFile
 
 SOGLIA_DIFF = 5.0  # |differenza %| oltre cui la cella diventa rossa
 
@@ -19,50 +19,36 @@ RIGA_MEDIA = "Media totale"
 RIGA_PRIMA = "Prima metà"
 RIGA_SECONDA = "Seconda metà"
 RIGA_DIFF = "Differenza"
+RIGHE = [RIGA_MEDIA, RIGA_PRIMA, RIGA_SECONDA, RIGA_DIFF]
 
 
-@st.cache_data(show_spinner=False)
-def _leggi_fc(contenuto: bytes) -> pd.DataFrame:
-    """Estrae timestamp e FC (bpm > 0) dai record del file .fit."""
-    righe = []
-    for rec in FitFile(io.BytesIO(contenuto)).get_messages("record"):
-        v = rec.get_values()
-        hr = v.get("heart_rate")
-        if hr is not None and hr > 0:
-            righe.append((v.get("timestamp"), float(hr)))
-    df = pd.DataFrame(righe, columns=["timestamp", "hr"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    return df
-
-
-def riepilogo_fc(df: pd.DataFrame) -> dict:
+def riepilogo_fc(raw: pd.DataFrame) -> dict:
     """Medie FC totale, prima metà, seconda metà e differenza %."""
+    vuoto = {r: None for r in RIGHE}
+    if raw is None or "hr" not in raw.columns or "timestamp" not in raw.columns:
+        return vuoto
+
+    df = raw[["timestamp", "hr"]].copy()
+    df["hr"] = pd.to_numeric(df["hr"], errors="coerce")
+    df = df[df["hr"] > 0].dropna().reset_index(drop=True)
     if df.empty:
-        return {RIGA_MEDIA: None, RIGA_PRIMA: None, RIGA_SECONDA: None, RIGA_DIFF: None}
+        return vuoto
 
-    hr = df["hr"].reset_index(drop=True)
-    ts = df["timestamp"].reset_index(drop=True)
-    if ts.notna().all():
-        # divisione a metà della durata (robusta a registrazione smart)
-        t = (ts - ts.iloc[0]).dt.total_seconds()
-        prima = t <= t.iloc[-1] / 2
-    else:
-        # senza timestamp: divisione a metà dei campioni
-        prima = pd.Series(range(len(hr))) < len(hr) / 2
+    # divisione a metà della durata (robusta a registrazione smart)
+    t = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds()
+    prima = t <= t.iloc[-1] / 2
 
-    m_tot = hr.mean()
-    m1 = hr[prima].mean()
-    m2 = hr[~prima].mean()
+    m_tot = df["hr"].mean()
+    m1 = df.loc[prima, "hr"].mean()
+    m2 = df.loc[~prima, "hr"].mean()
     diff = (m2 - m1) / m1 * 100 if pd.notna(m1) and pd.notna(m2) and m1 > 0 else None
     return {RIGA_MEDIA: m_tot, RIGA_PRIMA: m1, RIGA_SECONDA: m2, RIGA_DIFF: diff}
 
 
-def costruisci_tabella(files) -> pd.DataFrame:
+def costruisci_tabella(per_file_raw: dict) -> pd.DataFrame:
     """Una colonna per file, una riga per metrica."""
-    colonne = {}
-    for f in files:
-        colonne[f.name] = riepilogo_fc(_leggi_fc(f.getvalue()))
-    tab = pd.DataFrame(colonne, index=[RIGA_MEDIA, RIGA_PRIMA, RIGA_SECONDA, RIGA_DIFF])
+    colonne = {nome: riepilogo_fc(raw) for nome, raw in per_file_raw.items()}
+    tab = pd.DataFrame(colonne, index=RIGHE)
     tab.index.name = "Metrica (bpm)"
     return tab.astype(float)
 
@@ -91,31 +77,23 @@ def stile_tabella(tab: pd.DataFrame):
     )
 
 
-def render(files) -> None:
-    st.subheader("Riepilogo frequenza cardiaca")
+def render(per_file_raw: dict) -> None:
+    st.header("❤️ Riepilogo frequenza cardiaca")
 
-    if not files:
-        st.info("Carica uno o più file .fit per iniziare.")
+    if not per_file_raw:
+        st.info("Carica uno o più file .fit dalla sidebar per eseguire questa analisi.")
         return
 
-    # se cambiano i file caricati, il risultato precedente viene scartato
-    firma = tuple((f.name, f.size) for f in files)
-    if st.session_state.get("hrs_firma") != firma:
-        st.session_state["hrs_firma"] = firma
-        st.session_state.pop("hrs_tabella", None)
-
-    st.write(f"{len(files)} file caricati. Vuoi calcolare il riepilogo della frequenza cardiaca?")
-    if st.button("Avvia analisi", key="hrs_avvia"):
-        with st.spinner("Analisi in corso…"):
-            st.session_state["hrs_tabella"] = costruisci_tabella(files)
-
-    tab = st.session_state.get("hrs_tabella")
-    if tab is None:
-        return
-
+    tab = costruisci_tabella(per_file_raw)
     st.dataframe(stile_tabella(tab), use_container_width=True)
     st.caption(
         "Differenza = media della seconda metà rispetto alla prima metà. "
         f"Verde se entro ±{SOGLIA_DIFF:.0f}%, rosso se oltre. "
         "“—” = nessun dato di frequenza cardiaca nel file."
+    )
+    st.download_button(
+        "📥 Scarica riepilogo FC (CSV)",
+        data=tab.round(1).to_csv().encode("utf-8"),
+        file_name="riepilogo_fc.csv",
+        mime="text/csv",
     )
