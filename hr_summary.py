@@ -11,6 +11,7 @@ Uso nel main app:
 """
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 SOGLIA_DIFF = 5.0  # |differenza %| oltre cui la cella diventa rossa
@@ -94,6 +95,67 @@ def statistiche_insieme(tab: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def durata_ore(raw: pd.DataFrame) -> float:
+    """Durata del file in ore (primo-ultimo timestamp, soste incluse)."""
+    if raw is None or "timestamp" not in raw.columns:
+        return np.nan
+    ts = pd.to_datetime(raw["timestamp"], errors="coerce").dropna()
+    if len(ts) < 2:
+        return np.nan
+    return (ts.max() - ts.min()).total_seconds() / 3600.0
+
+
+def grafico_diff_durata(tab: pd.DataFrame, per_file_raw: dict):
+    """Dispersione: durata (h) vs differenza % FC. Ritorna (fig, r, n)."""
+    df = pd.DataFrame({
+        "file": tab.columns,
+        "durata_h": [durata_ore(per_file_raw[f]) for f in tab.columns],
+        "diff_pct": tab.loc[RIGA_DIFF].to_numpy(),
+    }).dropna()
+    if df.empty:
+        return None, np.nan, 0
+
+    colori = ["#1e6b35" if abs(v) <= SOGLIA_DIFF else "#a12a2a" for v in df["diff_pct"]]
+    x_max = max(df["durata_h"].max() * 1.05, 1.0)
+
+    fig = go.Figure()
+    # fascia ±soglia
+    fig.add_hrect(y0=-SOGLIA_DIFF, y1=SOGLIA_DIFF, fillcolor="#dff3e4",
+                  opacity=0.5, line_width=0, layer="below")
+    fig.add_hline(y=0, line_color="#888888", line_width=1, line_dash="dash")
+    fig.add_trace(go.Scatter(
+        x=df["durata_h"], y=df["diff_pct"], mode="markers",
+        marker=dict(size=11, color=colori, line=dict(width=1, color="white")),
+        customdata=df["file"],
+        hovertemplate="<b>%{customdata}</b><br>Durata %{x:.2f} h"
+                      "<br>Differenza %{y:+.1f}%<extra></extra>",
+        name="File",
+    ))
+
+    r = np.nan
+    if len(df) >= 3 and df["durata_h"].nunique() > 1:
+        b, a = np.polyfit(df["durata_h"], df["diff_pct"], 1)
+        r = float(np.corrcoef(df["durata_h"], df["diff_pct"])[0, 1])
+        x_line = np.array([0.0, x_max])
+        fig.add_trace(go.Scatter(
+            x=x_line, y=a + b * x_line, mode="lines",
+            line=dict(color="#1f4e79", width=2),
+            name=f"Retta: {a:+.1f} {b:+.2f}·h  (r = {r:.2f})",
+            hoverinfo="skip",
+        ))
+
+    fig.update_layout(
+        title="Differenza FC (2ª vs 1ª metà) in funzione della durata",
+        xaxis_title="Durata (h)",
+        yaxis_title="Differenza FC (%)",
+        xaxis=dict(range=[0, x_max]),
+        height=450,
+        showlegend=len(fig.data) > 1,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig, r, len(df)
+
+
 def _colore_diff(riga: pd.Series) -> list:
     if riga.name != RIGA_DIFF:
         return [""] * len(riga)
@@ -164,4 +226,21 @@ def render(per_file_raw: dict) -> None:
         data=stats_df.to_csv(index=False).encode("utf-8"),
         file_name="statistiche_fc.csv",
         mime="text/csv",
+    )
+
+    # --- 3) dispersione durata vs differenza % ---
+    st.divider()
+    st.subheader("3. Differenza FC vs durata")
+    fig, r, n = grafico_diff_durata(tab, per_file_raw)
+    if fig is None:
+        st.info("Nessun file con dati di frequenza cardiaca da mostrare.")
+        return
+    st.plotly_chart(fig, use_container_width=True, key="hr_diff_durata")
+    st.caption(
+        "Un punto per file. Fascia verde = differenza entro "
+        f"±{SOGLIA_DIFF:.0f}%. Durata = dal primo all'ultimo record, soste incluse. "
+        + ("La retta e r compaiono da 3 file in su. " if n < 3 else
+           f"r = {r:.2f} su {n} file: con pochi file è un indizio, non una prova. ")
+        + "Il calo di FC dipende anche da pacing e profilo del percorso "
+        "(es. prima metà in salita), non solo dalla fatica."
     )
