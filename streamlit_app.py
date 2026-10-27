@@ -9,6 +9,7 @@ import io
 from cpet_steady_state import render_cpet_analysis
 from forceplate_norms import render_forceplate_norms
 from hr_summary import render as render_hr_summary
+from jump_height_compare import render_jump_height_compare
 
 st.set_page_config(
     page_title="AMBRO BIG DATA BROTHER",
@@ -1834,13 +1835,14 @@ if per_file_bucket:
 # solo nel rerun del click e il risultato sparirebbe al widget successivo.
 st.divider()
 
-tab_dec, tab_slope, tab_cmp, tab_ef, tab_cpet, tab_fpn, tab_fc = st.tabs([
+tab_dec, tab_slope, tab_cmp, tab_ef, tab_cpet, tab_fpn, tab_jh, tab_fc = st.tabs([
     "📉 Decadimento EFS per bucket",
     "📐 Studio pendenze FC / EFS",
     "🆚 Race plan vs gara reale",
     "💓 Efficiency Factor",
     "🫁 CPET step & steady state",
     "🏋️ Norme Force Plate",
+    "🦘 Jump height FT vs NI",
     "❤️ Riepilogo FC",
 ])
 
@@ -1885,6 +1887,13 @@ with tab_fpn:
         render_forceplate_norms()
     else:
         st.info("☝️ Spunta la casella per calcolare le norme di popolazione Force Plate.")
+
+with tab_jh:
+    run_jh = st.checkbox(RUN_PROMPT, value=False, key="run_jh")
+    if run_jh:
+        render_jump_height_compare()
+    else:
+        st.info("☝️ Spunta la casella per confrontare jump height FT vs NI.")
 
 with tab_fc:
     run_fc = st.checkbox(RUN_PROMPT, value=False, key="run_fc")
