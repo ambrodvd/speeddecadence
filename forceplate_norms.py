@@ -183,7 +183,8 @@ def read_xlsx_record(file_bytes, filename):
       - IMTP 'Isometric results' con blocchi 'Trial N' (esercizio in A-B).
     In tutti: metadati generali in A-B, unità in G, blocchi da 3 colonne
     (variabile, valore, spacer) da H in poi. Il tipo di test è per
-    ripetizione ('jump type'); se manca, dall'esercizio o dal nome del file.
+    ripetizione ('jump type'); se manca, dal nome del file. Il layout
+    Trial N è sempre IMTP.
 
     read_only=False come nella Force Plate app: in alcuni export la
     dimensione del foglio è sbagliata e in sola lettura si vede una cella."""
@@ -220,8 +221,10 @@ def read_xlsx_record(file_bytes, filename):
         raise ValueError("nessun blocco 'Jump N' o 'Trial N' nella riga 1")
 
     if is_trial:
-        exercise = str(gen.get("exercise") or "").strip().lower()
-        fallback_type = exercise if exercise and exercise != "unknown" else "imtp"
+        # Il layout 'Isometric results' / 'Trial N' è solo IMTP. Il campo
+        # metadati 'Exercise' è libero e inaffidabile (visto 'Squat', 'IMTP',
+        # vuoto): non va usato come tipo di test.
+        fallback_type = "imtp"
     else:
         fallback_type = _guess_type_from_filename(filename)
 
@@ -330,10 +333,67 @@ def build_sessions(records, sex_override):
             warnings.append(f"{files}: nessun valore numerico. Escluso.")
             continue
 
-        sessions.append(dict(file=files, fonte="CSV" if is_csv else "XLSX", nome=nome,
+        sessions.append(dict(file=files, files=[r["file"] for r in recs],
+                             fonte="CSV" if is_csv else "XLSX", nome=nome,
                              data=recs[0]["data_label"], sesso=sex,
                              tests=sorted(df["Jump Type"].unique()), values=values))
     return sessions, warnings
+
+
+TEST_ORDER = ["imtp", "sj", "cmj", "cmrj", "dj"]
+
+
+def athlete_summary(records, sessions, sex_override):
+    """Una riga per atleta: sesso, ripetizioni per tipo di test, sedute
+    contate e file esclusi. Le ripetizioni sono quelle che entrano nelle
+    statistiche: niente doppioni né file coperti da un CSV dello stesso
+    giorno. Per chi non ha ancora il sesso, quelle che entreranno una volta
+    assegnato."""
+    counted = {f for s in sessions for f in s["files"]}
+    # File che conterebbero con il sesso assegnato a tutti (stesse regole
+    # di build_sessions, sesso fittizio: serve solo a sapere quali file).
+    placeholder = {k: "M" for k in athletes_without_sex(records)}
+    would_count = {f for s in build_sessions(records, {**placeholder, **sex_override})[0]
+                   for f in s["files"]}
+    known_sex = {}
+    for r in records:
+        if r["sesso"]:
+            known_sex.setdefault(_norm_name(r["nome"]), r["sesso"])
+
+    by_athlete = {}
+    for r in records:
+        by_athlete.setdefault(_norm_name(r["nome"]), []).append(r)
+
+    types = set()
+    for r in records:
+        types |= set(r["reps"]["Jump Type"].dropna().astype(str).str.strip().str.lower())
+    types -= {"", "—", "-", "nan", "none"}
+    cols = [t for t in TEST_ORDER if t in types] + sorted(types - set(TEST_ORDER))
+
+    rows = []
+    for n_key, recs in sorted(by_athlete.items(), key=lambda kv: kv[1][0]["nome"] or ""):
+        used, seen_f = [], set()
+        for r in recs:
+            if r["file"] in would_count and r["file"] not in seen_f:
+                used.append(r)
+                seen_f.add(r["file"])
+        jt = (pd.concat([r["reps"]["Jump Type"] for r in used]).astype(str).str.strip().str.lower()
+              if used else pd.Series(dtype=str))
+        counts = jt.value_counts()
+        sex = known_sex.get(n_key) or sex_override.get(n_key)
+        n_sed = sum(1 for s in sessions if _norm_name(s["nome"]) == n_key)
+        excl = [r["file"] for r in recs if r["file"] not in would_count]
+        if not sex:
+            excl = ["(sesso da assegnare)"] + excl
+        row = {"Atleta": recs[0]["nome"] or "—",
+               "Sesso": sex or "da assegnare",
+               "File": len(recs),
+               "Sedute contate": n_sed}
+        for t in cols:
+            row[t.upper()] = int(counts.get(t, 0))
+        row["File esclusi"] = ", ".join(excl) if excl else ""
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def athletes_without_sex(records):
@@ -567,6 +627,14 @@ def render_forceplate_norms():
     sessions, warns = build_sessions(records, sex_override)
     for w in warns:
         st.warning(f"⚠️ {w}")
+
+    st.subheader("Atleti trovati")
+    st.caption("Ripetizioni per tipo di test che entrano nelle statistiche. 'File esclusi': "
+               "doppioni, o XLSX di una seduta già coperta da un CSV dello stesso giorno "
+               "(vince il CSV). Gli atleti senza sesso non vengono contati finché non lo "
+               "assegni; i loro numeri mostrano cosa entrerà.")
+    st.dataframe(athlete_summary(records, sessions, sex_override),
+                 use_container_width=True, hide_index=True)
 
     if not sessions:
         st.error("Nessuna seduta utilizzabile: controlla il sesso degli atleti qui sopra.")
