@@ -2,16 +2,21 @@
 """
 Norme di popolazione Force Plate — modulo per AMBRO BIG DATA BROTHER
 
-Legge gli export completi della Force Plate app (forceplate_fulldata_*.csv,
-una riga per ripetizione) e calcola media e deviazione standard per sesso di
-ogni metrica, restituendo testo pronto da incollare nel codice:
+Legge due tipi di file, anche insieme:
+  - gli export completi della Force Plate app (forceplate_fulldata_*.csv,
+    una riga per ripetizione): ogni CSV è già una seduta;
+  - gli XLSX grezzi di ForceMate (un esercizio o più per file): i file dello
+    stesso atleta nello stesso giorno vengono uniti in una seduta.
+Calcola media e deviazione standard per sesso di ogni metrica, restituendo
+testo pronto da incollare nel codice:
 
   un unico dict DEFAULT_POP: prima le 13 costanti già usate dalla Force
   Plate app (stesse chiavi), poi un divisore, poi tutte le altre metriche
   registrate con chiave "jump_type::variabile".
 
 Scelte di metodo:
-  - Unità di osservazione = una seduta (un CSV). Più sedute dello stesso
+  - Unità di osservazione = una seduta (un CSV, oppure tutti gli XLSX dello
+    stesso atleta nello stesso giorno). Più sedute dello stesso
     atleta contano tutte. Ogni seduta viene prima ridotta alla media delle
     sue ripetizioni, poi si calcolano media e SD fra le sedute.
   - SD campionaria (ddof=1).
@@ -23,8 +28,12 @@ Scelte di metodo:
 
 from __future__ import annotations
 
+import datetime as dt
 import io
 import math
+import re
+
+import openpyxl
 
 import pandas as pd
 import streamlit as st
@@ -97,30 +106,226 @@ def _first(df, col):
     return None
 
 
-def read_session(file_bytes, filename):
-    """Un CSV -> dict con metadati e {(jump_type, var): media delle rep}.
-    Solleva ValueError con un messaggio leggibile se il file non va."""
+def _parse_day(raw):
+    """Data del test come datetime.date, da qualunque formato visto finora
+    (ForceMate '11.02.2026 15:31:57', CSV '03/10/2026', ISO)."""
+    if raw is None:
+        return None
+    if isinstance(raw, dt.datetime):
+        return raw.date()
+    if isinstance(raw, dt.date):
+        return raw
+    txt = str(raw).strip()
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return dt.datetime.strptime(txt, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _day_from_filename(filename):
+    """ForceMate nomina i file Nome_Cognome_ddmmyy-hh_mm_ss_TIPO.xlsx."""
+    m = re.search(r"_(\d{2})(\d{2})(\d{2})-\d{2}_\d{2}_\d{2}", filename)
+    if not m:
+        return None
+    try:
+        return dt.date(2000 + int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        return None
+
+
+def _name_from_filename(filename):
+    m = re.match(r"(.+?)_\d{6}-\d{2}_\d{2}_\d{2}", filename)
+    return m.group(1).replace("_", " ").strip() if m else None
+
+
+def _guess_type_from_filename(filename):
+    """Stessa regola della Force Plate app: usata solo per le ripetizioni
+    senza tag 'jump type'."""
+    fn = filename.upper()
+    for t in ("CMRJ", "IMTP", "CMJ", "SJ", "DJ"):
+        if t in fn:
+            return t.lower()
+    return None
+
+
+def _to_num(v):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip().replace(",", "."))
+        except ValueError:
+            return None
+    return None
+
+
+def read_csv_record(file_bytes, filename):
+    """Un export completo (CSV) -> record con le ripetizioni in un DataFrame
+    ('Jump Type' + una colonna per variabile)."""
     df = pd.read_csv(io.BytesIO(file_bytes), encoding="utf-8-sig")
     if "Jump Type" not in df.columns:
         raise ValueError("manca la colonna 'Jump Type' (non è un export completo)")
+    data_label = _first(df, "Data test")
+    reps = df[["Jump Type"] + [c for c in df.columns if c not in META_COLS]]
+    return dict(kind="csv", file=filename, nome=_first(df, "Nome"),
+                sesso=_sex_code(_first(df, "Sesso")),
+                giorno=_parse_day(data_label), data_label=data_label or "—", reps=reps)
 
-    sex = _sex_code(_first(df, "Sesso"))
-    if sex is None:
-        raise ValueError(f"sesso non riconosciuto ('{_first(df, 'Sesso')}')")
 
-    df["Jump Type"] = df["Jump Type"].astype(str).str.strip().str.lower()
-    df = df[~df["Jump Type"].isin(["", "—", "-", "nan", "none"])]
-    if df.empty:
-        raise ValueError("nessuna ripetizione con un tipo di test valido")
+def read_xlsx_record(file_bytes, filename):
+    """Un XLSX ForceMate -> record nello stesso formato del CSV. Stessa
+    lettura della Force Plate app: metadati nelle colonne A-F, unità in G,
+    blocchi 'Jump N' (variabile, valore, spacer) da H in poi; il tipo di
+    test è per ripetizione. Gestisce anche il layout IMTP 'Unit / Trial N'."""
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    rows = [tuple(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+    wb.close()
+    if not rows:
+        raise ValueError("file vuoto")
+    max_col = max(len(r) for r in rows)
 
-    var_cols = [c for c in df.columns if c not in META_COLS]
-    values = session_values(df, var_cols)
-    if not values:
-        raise ValueError("nessun valore numerico trovato")
+    def cell(r_idx, c_idx):  # 1-based come in Excel
+        row = rows[r_idx - 1] if 0 < r_idx <= len(rows) else ()
+        return row[c_idx - 1] if 0 < c_idx <= len(row) else None
 
-    return dict(file=filename, nome=_first(df, "Nome") or "—",
-                data=_first(df, "Data test") or "—", sesso=sex,
-                tests=sorted(df["Jump Type"].unique()), values=values)
+    def header_starts(prefix, first_col):
+        return [c for c in range(first_col, max_col + 1)
+                if cell(1, c) and str(cell(1, c)).strip().lower().startswith(prefix)]
+
+    imtp_layout = (str(cell(1, 7) or "").strip().lower() == "unit"
+                   and bool(header_starts("trial", 8)))
+
+    if imtp_layout:
+        # Nessun metadato nel file: nome e data dal nome del file, sesso
+        # da assegnare a mano; peso da 'system weight' come nella Force Plate app.
+        meta = dict(nome=_name_from_filename(filename), sesso=None,
+                    giorno=_day_from_filename(filename))
+        blocks, unit_col, fallback_type = header_starts("trial", 2), 1, "imtp"
+    else:
+        def kv(col_key, col_val):
+            out = {}
+            for r in range(1, 16):
+                k = cell(r, col_key)
+                if k:
+                    out[str(k).strip().lower()] = cell(r, col_val)
+            return out
+        gen, attr = kv(1, 2), kv(3, 4)
+        nome = str(attr.get("name") or gen.get("name") or "").strip() or _name_from_filename(filename)
+        meta = dict(nome=nome, sesso=_sex_code(attr.get("gender")),
+                    giorno=_parse_day(gen.get("date")) or _day_from_filename(filename))
+        blocks, unit_col, fallback_type = header_starts("jump", 8), 7, _guess_type_from_filename(filename)
+
+    reps = []
+    for bs in blocks:
+        var_col, val_col = bs, bs + 1
+        rep, jump_type = {}, None
+        for r in range(2, len(rows) + 1):
+            var = cell(r, var_col)
+            if not var:
+                continue
+            var = str(var).strip().lower()
+            val = cell(r, val_col)
+            if var == "jump type":
+                jump_type = str(val).strip().lower() if val else None
+                continue
+            if var == "tags":
+                continue
+            num = _to_num(val)
+            if num is not None:
+                rep[var] = num
+        if imtp_layout and "body mass" not in rep and rep.get("system weight"):
+            rep["body mass"] = rep["system weight"] / 9.80665
+        if rep:
+            rep["Jump Type"] = jump_type or fallback_type
+            reps.append(rep)
+
+    if not reps:
+        raise ValueError("nessuna ripetizione con valori numerici")
+    return dict(kind="xlsx", file=filename, nome=meta["nome"], sesso=meta["sesso"],
+                giorno=meta["giorno"],
+                data_label=meta["giorno"].strftime("%d/%m/%Y") if meta["giorno"] else "—",
+                reps=pd.DataFrame(reps))
+
+
+def _norm_name(nome):
+    return re.sub(r"\s+", " ", str(nome or "").strip().lower().rstrip("."))
+
+
+def build_sessions(records, sex_override):
+    """Raggruppa i record in sedute e calcola i valori di seduta.
+    - CSV: un file = una seduta.
+    - XLSX: stesso atleta + stesso giorno = una seduta.
+    Il sesso viene dal file; se manca, da un altro file dello stesso atleta;
+    se manca ancora, da sex_override {nome normalizzato: 'M'/'F'}.
+    Ritorna (sedute, avvisi)."""
+    warnings = []
+
+    # Sesso noto per atleta, da qualunque file
+    known_sex = {}
+    for r in records:
+        if r["sesso"]:
+            known_sex.setdefault(_norm_name(r["nome"]), r["sesso"])
+
+    groups = {}
+    for i, r in enumerate(records):
+        key = (_norm_name(r["nome"]), r["giorno"])
+        if r["kind"] == "csv" or r["giorno"] is None:
+            key = key + (i,)  # CSV o data ignota: seduta a sé
+        elif any(x["file"] == r["file"] for x in groups.get(key, [])):
+            warnings.append(f"{r['file']}: caricato due volte. Copia esclusa.")
+            continue
+        groups.setdefault(key, []).append(r)
+
+    sessions, seen = [], {}
+    for key, recs in groups.items():
+        nome_n, giorno = key[0], key[1]
+        nome = recs[0]["nome"] or "—"
+        files = ", ".join(r["file"] for r in recs)
+        is_csv = recs[0]["kind"] == "csv"
+
+        # Doppione: stesso atleta e giorno già coperto (es. CSV + i suoi XLSX)
+        if giorno is not None:
+            sig = (nome_n, giorno)
+            if sig in seen:
+                warnings.append(f"{files}: stesso atleta e stesso giorno di "
+                                f"{seen[sig]}, probabilmente un doppione. Escluso.")
+                continue
+            seen[sig] = files
+
+        sex = next((r["sesso"] for r in recs if r["sesso"]), None) \
+            or known_sex.get(nome_n) or sex_override.get(nome_n)
+        if sex is None:
+            continue  # segnalato nella UI come 'sesso da assegnare'
+
+        df = pd.concat([r["reps"] for r in recs], ignore_index=True, sort=False)
+        df["Jump Type"] = df["Jump Type"].astype(str).str.strip().str.lower()
+        df = df[~df["Jump Type"].isin(["", "—", "-", "nan", "none"])]
+        if df.empty:
+            warnings.append(f"{files}: nessuna ripetizione con un tipo di test valido. Escluso.")
+            continue
+        var_cols = [c for c in df.columns if c not in META_COLS]
+        values = session_values(df, var_cols)
+        if not values:
+            warnings.append(f"{files}: nessun valore numerico. Escluso.")
+            continue
+
+        sessions.append(dict(file=files, fonte="CSV" if is_csv else "XLSX", nome=nome,
+                             data=recs[0]["data_label"], sesso=sex,
+                             tests=sorted(df["Jump Type"].unique()), values=values))
+    return sessions, warnings
+
+
+def athletes_without_sex(records):
+    """Atleti per cui nessun file indica il sesso: {nome normalizzato: nome}."""
+    known = {_norm_name(r["nome"]) for r in records if r["sesso"]}
+    out = {}
+    for r in records:
+        n = _norm_name(r["nome"])
+        if n not in known:
+            out.setdefault(n, r["nome"] or "—")
+    return out
 
 
 def session_values(df, var_cols):
@@ -281,13 +486,15 @@ def _comment_extra(r):
 def render_forceplate_norms():
     st.header("🏋️ Norme di popolazione Force Plate")
     st.caption(
-        "Carica gli export completi della Force Plate app (forceplate_fulldata_...csv). "
-        "Ogni file è una seduta e conta come un'osservazione, anche se lo stesso atleta "
-        "compare più volte. Per ogni seduta si fa prima la media delle ripetizioni, poi "
-        "media e deviazione standard fra le sedute, separatamente per uomini e donne."
+        "Carica gli export completi della Force Plate app (forceplate_fulldata_...csv) e/o "
+        "gli XLSX grezzi di ForceMate, anche di un solo esercizio. Un CSV è una seduta; "
+        "gli XLSX dello stesso atleta nello stesso giorno vengono uniti in una seduta. "
+        "Ogni seduta conta come un'osservazione, anche se lo stesso atleta compare più "
+        "volte. Per ogni seduta si fa prima la media delle ripetizioni, poi media e "
+        "deviazione standard fra le sedute, separatamente per uomini e donne."
     )
 
-    files = st.file_uploader("CSV delle sedute", type=["csv"],
+    files = st.file_uploader("CSV e/o XLSX delle sedute", type=["csv", "xlsx"],
                              accept_multiple_files=True, key="fpn_files")
     min_n = st.number_input(
         "Sedute minime per sesso", min_value=2, value=DEFAULT_MIN_N, step=1, key="fpn_min_n",
@@ -296,26 +503,54 @@ def render_forceplate_norms():
     )
 
     if not files:
-        st.info("Carica almeno un CSV per iniziare.")
+        st.info("Carica almeno un file per iniziare.")
         return
 
-    sessions, seen = [], set()
+    records = []
     for f in files:
         try:
-            s = read_session(f.getvalue(), f.name)
+            reader = read_xlsx_record if f.name.lower().endswith(".xlsx") else read_csv_record
+            records.append(reader(f.getvalue(), f.name))
         except Exception as e:
             st.warning(f"⚠️ {f.name}: {e}. File escluso.")
-            continue
-        sig = (s["nome"], s["data"])
-        if sig in seen:
-            st.warning(f"⚠️ {f.name}: stessa persona e stessa data di un file già "
-                       "caricato, probabilmente un doppione. File escluso.")
-            continue
-        seen.add(sig)
-        sessions.append(s)
+
+    if not records:
+        st.error("Nessun file utilizzabile.")
+        return
+
+    # Sesso mancante: lista degli atleti sconosciuti, assegnazione nell'app
+    missing = athletes_without_sex(records)
+    sex_override = {}
+    if missing:
+        st.subheader("Sesso da assegnare")
+        slot = st.empty()  # riempito dopo il ciclo con il conteggio aggiornato
+        h1, h2, h3 = st.columns([3, 4, 2])
+        h1.markdown("**Atleta**")
+        h2.markdown("**File / date**")
+        h3.markdown("**Sesso**")
+        for n_key, nome in sorted(missing.items(), key=lambda kv: kv[1]):
+            recs = [r for r in records if _norm_name(r["nome"]) == n_key]
+            c1, c2, c3 = st.columns([3, 4, 2])
+            c1.write(nome)
+            c2.caption("  \n".join(f"{r['file']} — {r['data_label']}" for r in recs))
+            scelta = c3.radio(nome, ["—", "M", "F"], horizontal=True,
+                              key=f"fpn_sex_{n_key}", label_visibility="collapsed")
+            if scelta in ("M", "F"):
+                sex_override[n_key] = scelta
+        rimasti = len(missing) - len(sex_override)
+        if rimasti:
+            slot.warning(f"{rimasti} atleti su {len(missing)} senza sesso: le loro sedute "
+                         "non vengono contate finché non lo assegni.")
+        else:
+            slot.success(f"Sesso assegnato a tutti i {len(missing)} atleti.")
+        st.divider()
+
+    sessions, warns = build_sessions(records, sex_override)
+    for w in warns:
+        st.warning(f"⚠️ {w}")
 
     if not sessions:
-        st.error("Nessun file utilizzabile.")
+        st.error("Nessuna seduta utilizzabile: controlla il sesso degli atleti qui sopra.")
         return
 
     n_m = sum(s["sesso"] == "M" for s in sessions)
@@ -327,8 +562,8 @@ def render_forceplate_norms():
 
     with st.expander("Sedute caricate"):
         st.dataframe(pd.DataFrame([
-            dict(File=s["file"], Atleta=s["nome"], Sesso=s["sesso"], Data=s["data"],
-                 Test=", ".join(s["tests"])) for s in sessions
+            dict(Atleta=s["nome"], Sesso=s["sesso"], Data=s["data"], Fonte=s["fonte"],
+                 Test=", ".join(s["tests"]), File=s["file"]) for s in sessions
         ]), use_container_width=True, hide_index=True)
 
     curated = build_curated(sessions, min_n)
