@@ -175,11 +175,19 @@ def read_csv_record(file_bytes, filename):
 
 
 def read_xlsx_record(file_bytes, filename):
-    """Un XLSX ForceMate -> record nello stesso formato del CSV. Stessa
-    lettura della Force Plate app: metadati nelle colonne A-F, unità in G,
-    blocchi 'Jump N' (variabile, valore, spacer) da H in poi; il tipo di
-    test è per ripetizione. Gestisce anche il layout IMTP 'Unit / Trial N'."""
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    """Un XLSX ForceMate -> record nello stesso formato del CSV.
+
+    Layout gestiti (ForceMate cambia l'export fra versioni):
+      - salti con 'Player attributes' (nome/sesso in C-D) e 'Custom fields';
+      - salti senza 'Player attributes' (nome solo in A-B, sesso assente);
+      - IMTP 'Isometric results' con blocchi 'Trial N' (esercizio in A-B).
+    In tutti: metadati generali in A-B, unità in G, blocchi da 3 colonne
+    (variabile, valore, spacer) da H in poi. Il tipo di test è per
+    ripetizione ('jump type'); se manca, dall'esercizio o dal nome del file.
+
+    read_only=False come nella Force Plate app: in alcuni export la
+    dimensione del foglio è sbagliata e in sola lettura si vede una cella."""
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
     rows = [tuple(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
     wb.close()
     if not rows:
@@ -190,32 +198,37 @@ def read_xlsx_record(file_bytes, filename):
         row = rows[r_idx - 1] if 0 < r_idx <= len(rows) else ()
         return row[c_idx - 1] if 0 < c_idx <= len(row) else None
 
-    def header_starts(prefix, first_col):
-        return [c for c in range(first_col, max_col + 1)
+    def header_starts(prefix):
+        return [c for c in range(2, max_col + 1)
                 if cell(1, c) and str(cell(1, c)).strip().lower().startswith(prefix)]
 
-    imtp_layout = (str(cell(1, 7) or "").strip().lower() == "unit"
-                   and bool(header_starts("trial", 8)))
+    def kv(col_key, col_val):
+        out = {}
+        for r in range(1, 25):
+            k = cell(r, col_key)
+            v = cell(r, col_val)
+            if k and v not in (None, ""):
+                out[str(k).strip().lower()] = v
+        return out
 
-    if imtp_layout:
-        # Nessun metadato nel file: nome e data dal nome del file, sesso
-        # da assegnare a mano; peso da 'system weight' come nella Force Plate app.
-        meta = dict(nome=_name_from_filename(filename), sesso=None,
-                    giorno=_day_from_filename(filename))
-        blocks, unit_col, fallback_type = header_starts("trial", 2), 1, "imtp"
+    gen, attr = kv(1, 2), kv(3, 4)
+
+    blocks, is_trial = header_starts("jump"), False
+    if not blocks:
+        blocks, is_trial = header_starts("trial"), True
+    if not blocks:
+        raise ValueError("nessun blocco 'Jump N' o 'Trial N' nella riga 1")
+
+    if is_trial:
+        exercise = str(gen.get("exercise") or "").strip().lower()
+        fallback_type = exercise if exercise and exercise != "unknown" else "imtp"
     else:
-        def kv(col_key, col_val):
-            out = {}
-            for r in range(1, 16):
-                k = cell(r, col_key)
-                if k:
-                    out[str(k).strip().lower()] = cell(r, col_val)
-            return out
-        gen, attr = kv(1, 2), kv(3, 4)
-        nome = str(attr.get("name") or gen.get("name") or "").strip() or _name_from_filename(filename)
-        meta = dict(nome=nome, sesso=_sex_code(attr.get("gender")),
-                    giorno=_parse_day(gen.get("date")) or _day_from_filename(filename))
-        blocks, unit_col, fallback_type = header_starts("jump", 8), 7, _guess_type_from_filename(filename)
+        fallback_type = _guess_type_from_filename(filename)
+
+    nome = (str(attr.get("name") or gen.get("name") or "").strip()
+            or _name_from_filename(filename))
+    sesso = _sex_code(attr.get("gender") or gen.get("gender"))
+    giorno = _parse_day(gen.get("date")) or _day_from_filename(filename)
 
     reps = []
     for bs in blocks:
@@ -235,7 +248,9 @@ def read_xlsx_record(file_bytes, filename):
             num = _to_num(val)
             if num is not None:
                 rep[var] = num
-        if imtp_layout and "body mass" not in rep and rep.get("system weight"):
+        # IMTP: niente 'body mass', c'è 'system weight' (N). Stessa
+        # conversione della Force Plate app (g = 9.80665).
+        if "body mass" not in rep and rep.get("system weight"):
             rep["body mass"] = rep["system weight"] / 9.80665
         if rep:
             rep["Jump Type"] = jump_type or fallback_type
@@ -243,9 +258,8 @@ def read_xlsx_record(file_bytes, filename):
 
     if not reps:
         raise ValueError("nessuna ripetizione con valori numerici")
-    return dict(kind="xlsx", file=filename, nome=meta["nome"], sesso=meta["sesso"],
-                giorno=meta["giorno"],
-                data_label=meta["giorno"].strftime("%d/%m/%Y") if meta["giorno"] else "—",
+    return dict(kind="xlsx", file=filename, nome=nome, sesso=sesso, giorno=giorno,
+                data_label=giorno.strftime("%d/%m/%Y") if giorno else "—",
                 reps=pd.DataFrame(reps))
 
 
@@ -278,8 +292,13 @@ def build_sessions(records, sex_override):
             continue
         groups.setdefault(key, []).append(r)
 
+    # I CSV per primi: se un CSV e degli XLSX coprono lo stesso atleta nello
+    # stesso giorno vince il CSV (seduta completa, con le ripetizioni già
+    # scelte nella Force Plate app).
+    ordered = sorted(groups.items(), key=lambda kv: kv[1][0]["kind"] != "csv")
+
     sessions, seen = [], {}
-    for key, recs in groups.items():
+    for key, recs in ordered:
         nome_n, giorno = key[0], key[1]
         nome = recs[0]["nome"] or "—"
         files = ", ".join(r["file"] for r in recs)
@@ -290,7 +309,7 @@ def build_sessions(records, sex_override):
             sig = (nome_n, giorno)
             if sig in seen:
                 warnings.append(f"{files}: stesso atleta e stesso giorno di "
-                                f"{seen[sig]}, probabilmente un doppione. Escluso.")
+                                f"{seen[sig]}, già contato. Escluso.")
                 continue
             seen[sig] = files
 
