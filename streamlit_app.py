@@ -10,6 +10,7 @@ from cpet_steady_state import render_cpet_analysis
 from forceplate_norms import render_forceplate_norms
 from hr_summary import render as render_hr_summary
 from jump_height_compare import render_jump_height_compare
+from uphill_flat import render_uphill_flat
 
 st.set_page_config(
     page_title="AMBRO BIG DATA BROTHER",
@@ -1835,7 +1836,7 @@ if per_file_bucket:
 # solo nel rerun del click e il risultato sparirebbe al widget successivo.
 st.divider()
 
-tab_dec, tab_slope, tab_cmp, tab_ef, tab_cpet, tab_fpn, tab_jh, tab_fc = st.tabs([
+tab_dec, tab_slope, tab_cmp, tab_ef, tab_cpet, tab_fpn, tab_jh, tab_fc, tab_uf = st.tabs([
     "📉 Decadimento EFS per bucket",
     "📐 Studio pendenze FC / EFS",
     "🆚 Race plan vs gara reale",
@@ -1844,6 +1845,7 @@ tab_dec, tab_slope, tab_cmp, tab_ef, tab_cpet, tab_fpn, tab_jh, tab_fc = st.tabs
     "🏋️ Norme Force Plate",
     "🦘 Jump height FT vs NI",
     "❤️ Riepilogo FC",
+    "⛰️ Salita vs piano",
 ])
 
 with tab_dec:
@@ -1910,3 +1912,19 @@ with tab_fc:
         render_hr_summary(fc_raw)
     else:
         st.info("☝️ Spunta la casella per calcolare il riepilogo della frequenza cardiaca.")
+
+with tab_uf:
+    run_uf = st.checkbox(RUN_PROMPT, value=False, key="run_uf")
+    if run_uf:
+        uf_raw = {}
+        for f in uploaded_files or []:
+            try:
+                raw = load_raw(f.getvalue())  # solo parsing, niente EFD/EFS
+            except Exception as e:
+                st.warning(f"⚠️ {f.name}: file illeggibile, escluso ({e.__class__.__name__}).")
+                continue
+            if not raw.empty:
+                uf_raw[f.name] = raw
+        render_uphill_flat(uf_raw, resample_step)
+    else:
+        st.info("☝️ Spunta la casella per analizzare i tratti in salita e in piano.")
