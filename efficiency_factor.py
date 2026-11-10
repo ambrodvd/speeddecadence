@@ -1,113 +1,56 @@
-"""ANALISI — Efficiency Factor per file su finestra mobile, con statistiche
-aggregate e report HTML."""
+"""ANALISI — Efficiency Factor per file col metodo attuale del Race Analyzer
+(moto, blocchi consecutivi), con statistiche aggregate e report HTML.
+
+EF = EFS / (FC / soglia). La FC viene normalizzata sulla soglia (z4) e non
+lasciata in bpm: la FC di soglia è in larga parte genetica e non dice nulla
+su velocità o fitness, mentre dividendo per z4 due atleti alla stessa
+velocità relativa alla propria soglia ottengono lo stesso EF. Il numero
+risultante è "km/h equivalenti pianeggianti se corresse esattamente a soglia".
+
+Calcolo per blocco in ef_core.compute_block_table (colonne "moto"):
+EFD dei soli secondi in movimento ÷ secondi in movimento, FC media sugli
+stessi secondi. Metà gara come nel Race Analyzer: blocchi validi divisi in
+due per numero (len // 2), EF medio = media dei blocchi.
+"""
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from ef_core import (EF_BLOCK_CHOICES, EF_BLOCK_MIN_DEFAULT, MOVING_MIN_KMH_DEFAULT,
+                     MOVING_WIN_S, RA_MIN_BLOCKS, compute_block_table,
+                     read_hr_zones_csv)
 from fit_core import seconds_to_hhmm
 
-# --- Efficiency Factor (stessi parametri del DU COACHING RACE Analyzer) ---
-EF_WIN_MIN = 60      # finestra mobile (minuti)
-EF_STEP_MIN = 15     # passo tra finestre (minuti)
-EF_MIN_KMH = 0.5     # sotto = soste/ristori, non velocità reale
-EF_MAX_KMH = 30.0    # sopra = glitch GPS/quota
+# Soglie del Δ EF attualmente nel Race Analyzer, calcolate sull'archivio col
+# metodo VECCHIO (d/t). Mostrate accanto alle nuove per confronto.
+OLD_EF_DELTA_P25 = -1.76
+OLD_EF_DELTA_P75 = -0.91
 
 
-# ===========================================================
-# ANALISI 4 — Efficiency Factor per file
-# ===========================================================
-# EF = EFS / (FC / soglia). La FC viene normalizzata sulla soglia (z4) e non
-# lasciata in bpm: la FC di soglia è in larga parte genetica e non dice nulla
-# su velocità o fitness, mentre dividendo per z4 due atleti alla stessa
-# velocità relativa alla propria soglia ottengono lo stesso EF. Il numero
-# risultante è "km/h equivalenti pianeggianti se corresse esattamente a soglia".
-def read_hr_zones_csv(csv_file):
-    """Legge il CSV zone FC esportato dal Race Analyzer.
-    Ritorna (dict_zone, None) oppure (None, messaggio_errore).
-    Serve almeno z4 (soglia): è l'unico valore usato dall'EF."""
-    try:
-        zdf = pd.read_csv(csv_file)
-    except Exception as e:
-        return None, f"CSV illeggibile ({e.__class__.__name__})"
-    if zdf.empty:
-        return None, "CSV vuoto"
-
-    cols = {str(c).strip().lower(): c for c in zdf.columns}
-    if "z4" not in cols:
-        return None, "manca la colonna 'z4' (FC di soglia)"
-
-    thr = pd.to_numeric(zdf[cols["z4"]].iloc[0], errors="coerce")
-    if not np.isfinite(thr) or thr <= 0:
-        return None, "valore di 'z4' non valido"
-
-    zones = {"threshold": float(thr)}
-    for z in ["z1", "z2", "z3", "z4", "z5"]:
-        if z in cols:
-            v = pd.to_numeric(zdf[cols[z]].iloc[0], errors="coerce")
-            zones[z] = float(v) if np.isfinite(v) else np.nan
-    if "athlete_name" in cols:
-        zones["athlete"] = str(zdf[cols["athlete_name"]].iloc[0])
-    return zones, None
-
-
-def _segment_time_and_efs(segments):
-    """Tempo al centro segmento (ore) e EFS (km/h) ripulita da soste e glitch.
-    I valori fuori range restano NaN invece di essere eliminati, così gli
-    indici restano allineati alla griglia dei segmenti."""
-    dt = segments["dt_s"].to_numpy()
-    cum = np.cumsum(dt)
-    mid_h = (cum - dt / 2.0) / 3600.0
-    efs = segments["efs_ms"].to_numpy() * 3.6
-    efs = np.where(np.isfinite(efs) & (efs >= EF_MIN_KMH) & (efs <= EF_MAX_KMH),
-                   efs, np.nan)
-    return mid_h, efs
-
-
-def compute_ef_series(raw, segments, hr_threshold):
-    """Serie EF a finestra mobile. Ritorna un DataFrame o None se la traccia
-    è troppo corta / senza FC per riempire almeno 4 finestre."""
-    if raw is None or segments is None or not hr_threshold or hr_threshold <= 0:
-        return None
-    if "hr" not in raw.columns:
-        return None
-
-    hr_ok = raw.dropna(subset=["hr", "elapsed_s"])
-    if len(hr_ok) < 10:
-        return None
-
-    hr_h = hr_ok["elapsed_s"].to_numpy() / 3600.0
-    hr_v = hr_ok["hr"].rolling(window=3, min_periods=1).mean().to_numpy()
-
-    seg_h, seg_efs = _segment_time_and_efs(segments)
-    if not np.isfinite(seg_efs).any():
-        return None
-
-    w = EF_WIN_MIN / 60.0
-    t = max(float(hr_h.min()), float(seg_h.min())) + w / 2
-    t_end = min(float(hr_h.max()), float(seg_h.max())) - w / 2
-
-    rows = []
-    while t <= t_end:
-        mh = (hr_h >= t - w / 2) & (hr_h <= t + w / 2)
-        me = (seg_h >= t - w / 2) & (seg_h <= t + w / 2) & np.isfinite(seg_efs)
-        if mh.sum() >= 10 and me.sum() >= 5:
-            hrm = float(np.nanmean(hr_v[mh]))
-            efm = float(np.nanmean(seg_efs[me]))
-            if hrm > 0 and np.isfinite(efm):
-                rel = hrm / hr_threshold
-                rows.append({
-                    "t_h": t,
-                    "hr_bpm": hrm,
-                    "hr_rel_pct": rel * 100.0,
-                    "efs_kmh": efm,
-                    "ef": efm / rel,
-                })
-        t += EF_STEP_MIN / 60.0
-
-    if len(rows) < 4:
-        return None
-    return pd.DataFrame(rows)
+def compute_ef_series(raw, hr_threshold, moving_min_kmh, block_min):
+    """Serie EF per blocco col metodo moto, nello stesso formato usato dal
+    grafico (t_h, ef, hr_bpm, hr_rel_pct, efs_kmh) più le colonne del blocco.
+    Ritorna (DataFrame, None) oppure (None, motivo)."""
+    tbl, info = compute_block_table(raw, hr_threshold, moving_min_kmh=moving_min_kmh,
+                                    block_min=block_min)
+    if tbl is None:
+        return None, info
+    ok = tbl[np.isfinite(tbl["EF moto"])]
+    if len(ok) < RA_MIN_BLOCKS:
+        return None, (f"solo {len(ok)} blocchi validi da {block_min:g} min "
+                      f"(ne servono almeno {RA_MIN_BLOCKS})")
+    ef_df = pd.DataFrame({
+        "blocco": ok["Blocco"].to_numpy(),
+        "t_h": ok["_mid_h"].to_numpy(),
+        "ef": ok["EF moto"].to_numpy(),
+        "hr_bpm": ok["FC media moto (bpm)"].to_numpy(),
+        "hr_rel_pct": ok["% soglia moto"].to_numpy(),
+        "efs_kmh": ok["EFS moto (km/h)"].to_numpy(),
+        "tempo_fermo_s": ok["Tempo fermo (s)"].to_numpy(),
+        "ef_ra_vecchio": ok["EF Race Analyzer"].to_numpy(),
+    })
+    return ef_df, info
 
 
 def _pad_range(arr, frac=0.10):
@@ -190,7 +133,7 @@ def ef_stats(ef_df):
 
 # Colonne numeriche del riepilogo su cui ha senso calcolare statistiche.
 EF_STAT_COLS = ["EF 1ª metà", "EF 2ª metà", "Delta", "EF medio",
-                "Soglia (bpm)", "EFD (km)", "Durata (h)"]
+                "Soglia (bpm)", "EFD (km)", "Durata (h)", "Tempo fermo (min)"]
 
 
 def ef_descriptive_stats(summary_df):
@@ -294,8 +237,10 @@ def _df_to_html(df):
                       na_rep="—")
 
 
+
 def build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df,
-                  n_excluded=0):
+                  n_excluded=0, block_min=EF_BLOCK_MIN_DEFAULT,
+                  moving_min_kmh=MOVING_MIN_KMH_DEFAULT, delta_thresholds=None):
     """Report HTML autoconsistente: tabella riassuntiva + un grafico e le
     metriche per ciascun file. plotly.js caricato una volta sola da CDN,
     quindi le figure vanno inserite con include_plotlyjs=False."""
@@ -313,7 +258,9 @@ def build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df,
         ".meta{color:#555;font-size:14px;} .note{color:#555;font-size:13px;margin-top:10px;}",
         "</style></head><body>",
         "<h1>Efficiency Factor</h1>",
-        f"<p class='meta'>Finestra mobile {EF_WIN_MIN} min, passo {EF_STEP_MIN} min. "
+        f"<p class='meta'>Metodo moto del Race Analyzer: blocchi da {block_min:g} min, "
+        f"soglia di movimento {moving_min_kmh:g} km/h. EFS e FC sui soli secondi in "
+        "movimento. "
         "EF = EFS &divide; (FC / soglia): velocità equivalente pianeggiante per "
         "unità di sforzo relativo (1.0 = a soglia). Essendo la FC normalizzata "
         "sulla soglia di ciascun atleta, il numero è confrontabile tra atleti "
@@ -323,6 +270,13 @@ def build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df,
            if n_excluded else "")
         + ".</p>",
     ]
+
+    if delta_thresholds is not None:
+        p25, p75, n = delta_thresholds
+        parts.append("<h2>Soglie Δ EF ricalcolate</h2>")
+        parts.append(f"<p class='meta'>Su <b>{n}</b> file: p25 = <b>{p25:+.2f}</b>, "
+                     f"p75 = <b>{p75:+.2f}</b> (Race Analyzer attuale, metodo vecchio: "
+                     f"p25 = {OLD_EF_DELTA_P25:+.2f}, p75 = {OLD_EF_DELTA_P75:+.2f}).</p>")
 
     if stats_df is not None and not stats_df.empty:
         parts.append("<h2>Statistiche descrittive</h2>")
@@ -354,7 +308,7 @@ def build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df,
             f"bucket <b>{b.get('bucket', '—')}</b> &middot; "
             f"soglia FC (z4) <b>{b['threshold']:.0f} bpm</b>"
             + (f" &middot; atleta: {b['athlete']}" if b.get("athlete") else "")
-            + f" &middot; finestre valide: {s['n_windows']}</p>"
+            + f" &middot; blocchi validi: {s['n_windows']}</p>"
         )
         parts.append(
             "<table><tr><th>EF 1ª metà</th><th>EF 2ª metà</th>"
@@ -372,18 +326,33 @@ def build_ef_html(blocks, summary_df, stats_df, group_tables, corr_df,
     return "\n".join(parts)
 
 
-def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
-                       per_file_bucket, bucket_order):
+def render_ef_analysis(per_file_raw, per_file_summary, per_file_bucket, bucket_order):
     st.header("💓 Efficiency Factor per file")
     st.caption(
-        f"EF = EFS ÷ (FC / soglia), su finestra mobile di {EF_WIN_MIN} minuti con passo "
-        f"{EF_STEP_MIN} minuti. Serve la FC di soglia (z4) di ciascun file: caricala con "
-        "il CSV delle zone esportato dal Race Analyzer. I file senza CSV vengono saltati."
+        "EF = EFS ÷ (FC / soglia) col metodo attuale del Race Analyzer (**moto**): "
+        "blocchi consecutivi, EFS e FC calcolati sui soli secondi in movimento. "
+        "Serve la FC di soglia (z4) di ciascun file: caricala con il CSV delle zone "
+        "esportato dal Race Analyzer. I file senza CSV vengono saltati."
     )
 
     if not per_file_raw:
         st.info("Carica uno o più file .fit dalla sidebar per eseguire questa analisi.")
         return
+
+    c_blk, c_mov = st.columns(2)
+    block_min = c_blk.select_slider(
+        "Ampiezza dei blocchi (minuti)", options=EF_BLOCK_CHOICES,
+        value=EF_BLOCK_MIN_DEFAULT, key="ef_tab_block_min",
+        help="Stesse scelte del Race Analyzer. Per confrontarti con le soglie del "
+             "Race Analyzer usa lo stesso valore che usi lì (default 15).",
+    )
+    moving_min_kmh = c_mov.slider(
+        "Soglia di movimento (km/h)", 0.25, 3.0, MOVING_MIN_KMH_DEFAULT, step=0.25,
+        key="ef_tab_moving_kmh",
+        help=f"Spostamento in linea d'aria su {MOVING_WIN_S} s: sotto questa velocità "
+             "l'atleta è considerato fermo. Default del Race Analyzer: "
+             f"{MOVING_MIN_KMH_DEFAULT:g} km/h.",
+    )
 
     # --- 1) una casella di upload per ogni file .fit caricato ---
     # Qui sta anche l'interruttore di esclusione: le statistiche vengono
@@ -423,29 +392,29 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
     # --- calcolo EF sui soli file con soglia disponibile ---
     blocks, summary_rows = [], []
     for fname, zones in zones_by_file.items():
-        ef_df = compute_ef_series(per_file_raw[fname], per_file_segments[fname],
-                                  zones["threshold"])
+        ef_df, info = compute_ef_series(per_file_raw[fname], zones["threshold"],
+                                        moving_min_kmh, block_min)
         if ef_df is None:
-            st.warning(f"⚠️ {fname}: traccia troppo corta o senza FC utilizzabile "
-                       f"(servono almeno 4 finestre da {EF_WIN_MIN} min), file saltato.")
+            st.warning(f"⚠️ {fname}: {info}, file saltato.")
             continue
 
         stats = ef_stats(ef_df)
         fig = build_ef_figure(
             ef_df, per_file_raw[fname],
-            f"{fname} — Efficiency Factor (finestra {EF_WIN_MIN} min)",
+            f"{fname} — Efficiency Factor moto (blocchi {block_min:g} min)",
         )
         summ = per_file_summary.get(fname, {})
         total_time_s = summ.get("total_time_s", np.nan)
         efd_km = summ.get("efd_m", np.nan) / 1000
         bucket_name = per_file_bucket.get(fname, ("—", np.nan))[0]
+        stopped_min = float(ef_df["tempo_fermo_s"].sum()) / 60.0
 
         blocks.append({
             "name": fname, "ef_df": ef_df, "fig": fig, "stats": stats,
             "threshold": zones["threshold"], "athlete": zones.get("athlete"),
             "excluded": fname in excluded_files,
             "efd_km": efd_km, "durata": seconds_to_hhmm(total_time_s),
-            "bucket": bucket_name,
+            "bucket": bucket_name, "dist_src": info,
         })
 
         summary_rows.append({
@@ -458,11 +427,13 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
             "Durata": seconds_to_hhmm(total_time_s),
             "Durata (h)": total_time_s / 3600 if np.isfinite(total_time_s) else np.nan,
             "EFD (km)": efd_km,
+            "Tempo fermo (min)": stopped_min,
             "EF 1ª metà": stats["ef_first_half"],
             "EF 2ª metà": stats["ef_second_half"],
             "Delta": stats["ef_delta"],
             "EF medio": stats["ef_mean"],
-            "Finestre": stats["n_windows"],
+            "Blocchi": stats["n_windows"],
+            "Distanza": info,
         })
 
     if not blocks:
@@ -473,14 +444,39 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
     summary_df = full_df.drop(columns=["_excl"])
     stats_source = full_df[~full_df["_excl"]].drop(columns=["_excl"])
     n_excluded = int(full_df["_excl"].sum())
+    n_gps = int((full_df["Distanza"] != "dispositivo").sum())
 
     # --- 2) statistiche sull'insieme dei file (in cima, prima dei grafici) ---
     st.divider()
     st.subheader("2. Statistiche sull'insieme dei file")
+    if n_gps:
+        st.warning(f"⚠️ {n_gps} file senza distanza del dispositivo: usano la distanza "
+                   "GPS e i loro numeri possono differire da quelli del Race Analyzer.")
+    delta_thresholds = None
     if stats_source.empty:
         st.warning("Tutti i file sono esclusi: nessuna statistica da calcolare.")
         stats_df, group_tables, corr_df = pd.DataFrame(), [], pd.DataFrame()
     else:
+        # Soglie del Δ EF da riportare nel Race Analyzer (EF_DELTA_P25/P75)
+        d = pd.to_numeric(stats_source["Delta"], errors="coerce").dropna()
+        if len(d):
+            delta_thresholds = (float(d.quantile(0.25)), float(d.quantile(0.75)), len(d))
+            p25, p75, n = delta_thresholds
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Nuovo p25 Δ EF", f"{p25:+.2f}", f"{p25 - OLD_EF_DELTA_P25:+.2f} vs attuale",
+                      delta_color="off")
+            c2.metric("Nuovo p75 Δ EF", f"{p75:+.2f}", f"{p75 - OLD_EF_DELTA_P75:+.2f} vs attuale",
+                      delta_color="off")
+            c3.metric("File usati", f"{n}")
+            st.caption(
+                f"Valori da copiare in EF_DELTA_P25 / EF_DELTA_P75 del Race Analyzer. "
+                f"Quelli attuali ({OLD_EF_DELTA_P25:+.2f} / {OLD_EF_DELTA_P75:+.2f}) sono "
+                "stati calcolati col metodo vecchio. Valgono solo per blocchi da "
+                f"{block_min:g} min e soglia {moving_min_kmh:g} km/h: se nel Race Analyzer "
+                "usi valori diversi, rimettili uguali qui prima di copiarli."
+                + (" Con pochi file i percentili sono instabili." if n < 20 else "")
+            )
+
         st.caption(
             f"**{len(stats_source)} file nelle statistiche**"
             + (f" ({n_excluded} esclusi manualmente)" if n_excluded else "")
@@ -529,6 +525,7 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
             f"EFD **{b['efd_km']:.2f} km** · durata **{b['durata']}** · "
             f"bucket **{b['bucket']}** · soglia FC **{b['threshold']:.0f} bpm**"
             + (f" · atleta **{b['athlete']}**" if b.get("athlete") else "")
+            + f" · distanza: **{b['dist_src']}**"
         )
         st.plotly_chart(b["fig"], use_container_width=True,
                         key=f"ef_chart_{b['name']}")
@@ -542,17 +539,18 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
             "l'atleta corresse esattamente a soglia."
         )
 
-    # I dati per finestra non vengono più stampati (né a schermo né nel report):
+    # I dati per blocco non vengono stampati (né a schermo né nel report):
     # con molti file erano decine di tabelle e un HTML enorme. Restano
     # disponibili in un unico CSV per chi vuole rilavorarli.
-    windows_df = pd.concat(
+    blocks_df = pd.concat(
         [b["ef_df"].assign(file=b["name"], escluso=b["excluded"]) for b in blocks],
         ignore_index=True
-    )[["file", "escluso", "t_h", "ef", "hr_bpm", "hr_rel_pct", "efs_kmh"]]
+    )[["file", "escluso", "blocco", "t_h", "ef", "hr_bpm", "hr_rel_pct", "efs_kmh",
+       "tempo_fermo_s", "ef_ra_vecchio"]]
     st.download_button(
-        "📥 Scarica i dati EF per finestra, tutti i file (CSV)",
-        data=windows_df.to_csv(index=False).encode("utf-8"),
-        file_name="efficiency_factor_finestre.csv",
+        "📥 Scarica i dati EF per blocco, tutti i file (CSV)",
+        data=blocks_df.to_csv(index=False).encode("utf-8"),
+        file_name="efficiency_factor_blocchi.csv",
         mime="text/csv",
     )
 
@@ -560,7 +558,9 @@ def render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
     st.divider()
     st.subheader("4. Report HTML")
     html_report = build_ef_html(blocks, summary_df, stats_df, group_tables,
-                                corr_df, n_excluded)
+                                corr_df, n_excluded, block_min=block_min,
+                                moving_min_kmh=moving_min_kmh,
+                                delta_thresholds=delta_thresholds)
     st.download_button(
         "📥 Scarica il report HTML",
         data=html_report.encode("utf-8"),

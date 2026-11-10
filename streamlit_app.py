@@ -173,7 +173,7 @@ with tab_cmp:
 with tab_ef:
     run_ef = st.checkbox(RUN_PROMPT, value=False, key="run_ef")
     if run_ef:
-        render_ef_analysis(per_file_raw, per_file_segments, per_file_summary,
+        render_ef_analysis(per_file_raw, per_file_summary,
                            per_file_bucket, bucket_order)
     else:
         st.info("☝️ Spunta la casella per calcolare l'Efficiency Factor.")
